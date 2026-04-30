@@ -31,6 +31,20 @@ test("scanSessions reads Codex JSONL metadata", async () => {
   assert.match(sessions[0].preview, /hello secret/);
 });
 
+test("scanSessions keeps fork session id separate from embedded parent metadata", async () => {
+  const { codexHome, parentId, forkId, parentPath, forkPath } = await forkFixture();
+
+  const sessions = await scanSessions({ codexHome });
+  const parent = sessions.find((session) => session.file === parentPath);
+  const fork = sessions.find((session) => session.file === forkPath);
+
+  assert.equal(parent.id, parentId);
+  assert.equal(fork.id, forkId);
+  assert.equal(fork.parentSessionId, parentId);
+  assert.equal(resolveSessionSelectors(sessions, [parentId], { allowMany: false })[0].file, parentPath);
+  assert.equal(resolveSessionSelectors(sessions, [forkId], { allowMany: false })[0].file, forkPath);
+});
+
 test("resolveSessionSelectors supports latest, index, id prefix, and path", async () => {
   const { codexHome, sessionPath } = await fixture();
   const sessions = await scanSessions({ codexHome });
@@ -206,4 +220,60 @@ async function fixture() {
   await fs.writeFile(sessionPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
   return { root, codexHome, managerHome, sessionPath };
+}
+
+async function forkFixture() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "coldxx-fork-test-"));
+  const codexHome = path.join(root, ".codex");
+  const sessionDir = path.join(codexHome, "sessions", "2026", "04", "25");
+  const parentId = "019dc22e-52f7-71f0-b2ba-780084c3555b";
+  const forkId = "019dc23d-64fd-72d1-8082-74c9a3e46fc8";
+  const parentPath = path.join(sessionDir, `rollout-2026-04-25T09-08-29-${parentId}.jsonl`);
+  const forkPath = path.join(sessionDir, `rollout-2026-04-25T09-24-56-${forkId}.jsonl`);
+
+  const parentRecords = [
+    {
+      timestamp: "2026-04-25T01:08:43.239Z",
+      type: "session_meta",
+      payload: {
+        id: parentId,
+        timestamp: "2026-04-25T01:08:29.061Z",
+        cwd: "/work/project",
+      },
+    },
+  ];
+  const forkRecords = [
+    {
+      timestamp: "2026-04-25T01:24:56.763Z",
+      type: "session_meta",
+      payload: {
+        id: forkId,
+        forked_from_id: parentId,
+        timestamp: "2026-04-25T01:24:56.706Z",
+        cwd: "/work/project",
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: parentId,
+            },
+          },
+        },
+      },
+    },
+    {
+      timestamp: "2026-04-25T01:24:56.766Z",
+      type: "session_meta",
+      payload: {
+        id: parentId,
+        timestamp: "2026-04-25T01:08:29.061Z",
+        cwd: "/work/project",
+      },
+    },
+  ];
+
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(parentPath, `${parentRecords.map((record) => JSON.stringify(record)).join("\n")}\n`);
+  await fs.writeFile(forkPath, `${forkRecords.map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+  return { root, codexHome, parentId, forkId, parentPath, forkPath };
 }

@@ -264,6 +264,7 @@ export async function readSessionSummary(filePath, options = {}) {
   const stat = await fs.stat(filePath);
   const summary = {
     id: idFromFilename(filePath),
+    parentSessionId: "",
     file: filePath,
     relativePath: safeRelative(root, filePath),
     startedAt: timestampFromFilename(filePath) || stat.birthtime.toISOString(),
@@ -283,6 +284,7 @@ export async function readSessionSummary(filePath, options = {}) {
     const { records } = await readJsonl(filePath);
     summary.lines = records.length;
     let fallbackPreview = "";
+    let primaryMetaSeen = false;
 
     for (const record of records) {
       const recordType = textValue(record?.type);
@@ -297,8 +299,13 @@ export async function readSessionSummary(filePath, options = {}) {
         summary.roles[role] = (summary.roles[role] || 0) + 1;
       }
 
-      if (recordType === "session_meta" && isPlainObject(record.payload)) {
+      if (recordType === "session_meta" && isPlainObject(record.payload) && !primaryMetaSeen) {
+        primaryMetaSeen = true;
         summary.id = textValue(record.payload.id) || summary.id;
+        summary.parentSessionId =
+          textValue(record.payload.forked_from_id) ||
+          textValue(record.payload.source?.subagent?.thread_spawn?.parent_thread_id) ||
+          summary.parentSessionId;
         summary.startedAt = textValue(record.payload.timestamp) || summary.startedAt;
         summary.cwd = textValue(record.payload.cwd) || summary.cwd;
         summary.model =

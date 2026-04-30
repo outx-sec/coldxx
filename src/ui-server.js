@@ -300,6 +300,7 @@ function parseRecordJson(input) {
 function publicSession(session, state) {
   return {
     id: session.id,
+    parentSessionId: session.parentSessionId,
     shortId: session.shortId,
     file: session.file,
     relativePath: session.relativePath,

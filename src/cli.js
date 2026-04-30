@@ -398,6 +398,7 @@ function formatSessionTable(sessions, options = {}) {
 function formatSessionDetails(summary, records, limit) {
   const lines = [
     `id:          ${summary.id}`,
+    `parent id:   ${summary.parentSessionId || "-"}`,
     `file:        ${summary.file}`,
     `started:     ${summary.startedAt}`,
     `updated:     ${summary.updatedAt}`,
