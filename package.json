@@ -1,0 +1,42 @@
+{
+  "name": "coldxx",
+  "version": "0.1.2",
+  "description": "Local Codex session management CLI and UI for listing, cleaning, backing up, and editing JSONL sessions.",
+  "type": "module",
+  "homepage": "https://github.com/outx-sec/coldxx#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/outx-sec/coldxx.git"
+  },
+  "bugs": {
+    "url": "https://github.com/outx-sec/coldxx/issues"
+  },
+  "bin": {
+    "coldxx": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "docs/assets/coldxx-preview.jpg",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "check": "node --check src/core.js && node --check src/ui-server.js && node --check src/cli.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "codex",
+    "coldxx",
+    "session",
+    "cli",
+    "jsonl"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
