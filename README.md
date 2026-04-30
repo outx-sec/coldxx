@@ -44,6 +44,12 @@ coldxx
 
 ## Quick Start
 
+Check the installed version:
+
+```sh
+coldxx -v
+```
+
 Check the paths coldxx will use:
 
 ```sh

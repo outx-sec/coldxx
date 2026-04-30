@@ -35,6 +35,7 @@ const BOOLEAN_FLAGS = new Set([
   "permanent",
   "raw",
   "regex",
+  "version",
   "yes",
 ]);
 
@@ -43,11 +44,17 @@ const SHORT_FLAGS = new Map([
   ["h", "help"],
   ["j", "json"],
   ["n", "limit"],
+  ["v", "version"],
   ["y", "yes"],
 ]);
 
 export async function main(argv = process.argv.slice(2), io = process) {
   const parsed = parseArgs(argv);
+
+  if (parsed.options.version) {
+    io.stdout.write(await versionText());
+    return 0;
+  }
 
   if (!parsed.command || parsed.options.help) {
     io.stdout.write(helpText());
@@ -615,6 +622,7 @@ Options:
   --allow-active        allow writes to sessions updated within the active window
   --active-window-minutes N
                         active-session guard window, default: 10
+  --version, -v         print version
   --yes, -y             required for writes
   --dry-run             preview without writing
 
@@ -627,6 +635,11 @@ Examples:
   coldxx drop latest --lines 12-18 --dry-run
   coldxx ui
 `;
+}
+
+async function versionText() {
+  const packageJson = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf8"));
+  return `coldxx ${packageJson.version}\n`;
 }
 
 function isCliEntryPoint() {
