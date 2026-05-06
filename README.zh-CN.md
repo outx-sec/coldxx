@@ -24,22 +24,26 @@
 要求 Node.js 20 或更新版本。
 
 ```sh
+npm install -g coldxx
+```
+
+如果你使用的 npm 镜像还没有同步，可以直接走 npm 官方源：
+
+```sh
+npm install -g coldxx --registry=https://registry.npmjs.org/
+```
+
+从源码运行：
+
+```sh
 git clone https://github.com/outx-sec/coldxx.git
 cd coldxx
 npm install
 npm link
 ```
 
-不想 link 也可以直接运行：
-
 ```sh
 node ./src/cli.js list
-```
-
-link 后会得到一个命令：
-
-```sh
-coldxx
 ```
 
 ## 30 秒上手

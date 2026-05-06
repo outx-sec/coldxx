@@ -24,22 +24,26 @@ coldxx is a local Codex session manager. It reads JSONL session files from `~/.c
 Node.js 20 or newer is required.
 
 ```sh
+npm install -g coldxx
+```
+
+If your npm mirror has not synced the package yet, install from the official registry:
+
+```sh
+npm install -g coldxx --registry=https://registry.npmjs.org/
+```
+
+To run from source:
+
+```sh
 git clone https://github.com/outx-sec/coldxx.git
 cd coldxx
 npm install
 npm link
 ```
 
-You can also run it without linking:
-
 ```sh
 node ./src/cli.js list
-```
-
-After linking:
-
-```sh
-coldxx
 ```
 
 ## Quick Start
