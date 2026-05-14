@@ -609,7 +609,7 @@ Usage:
 Selectors:
   latest            most recent session
   1, 2, 3           index from "coldxx list" sorted newest first
-  <id-prefix>       session id prefix, for example 019dd36c
+  <id-prefix>       session id prefix, for example a1111111
   <path>            absolute or relative session file path
 
 Options:
@@ -630,8 +630,8 @@ Options:
 Examples:
   coldxx list --limit 20
   coldxx show latest
-  coldxx clean 019dd36c --dry-run
-  coldxx clean 019dd36c --yes
+  coldxx clean a1111111 --dry-run
+  coldxx clean a1111111 --yes
   coldxx edit latest --replace API_KEY --with "[REDACTED]" --scope messages --yes
   coldxx drop latest --lines 12-18 --dry-run
   coldxx ui

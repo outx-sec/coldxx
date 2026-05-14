@@ -628,7 +628,7 @@ export async function dropSessionLines(filePath, options = {}) {
   if (!dryRun && selected.size > 0) {
     result.backup = await createBackup(filePath, {
       managerHome: options.managerHome,
-      reason: `drop lines ${options.lines}`,
+      reason: options.reason || `drop lines ${options.lines}`,
     });
     await writeJsonlAtomic(filePath, nextRecords);
   }
@@ -644,6 +644,13 @@ export async function replaceInSession(filePath, options = {}) {
   const replacement = typeof options.to === "string" ? options.to : "";
   const scope = options.scope || "all";
   const dryRun = booleanOption(options, "dryRun", "dry-run");
+  const lineScope = Array.isArray(options.lines)
+    ? new Set(
+        options.lines
+          .map((line) => Number.parseInt(String(line), 10))
+          .filter((line) => Number.isInteger(line) && line > 0),
+      )
+    : null;
   const matcher = buildMatcher({
     from: options.from,
     replacement,
@@ -655,7 +662,11 @@ export async function replaceInSession(filePath, options = {}) {
   let replacements = 0;
   let changedRecords = 0;
 
-  const nextRecords = records.map((record) => {
+  const nextRecords = records.map((record, index) => {
+    const line = index + 1;
+    if (lineScope && !lineScope.has(line)) {
+      return record;
+    }
     if (!recordMatchesScope(record, scope)) {
       return record;
     }
@@ -676,6 +687,7 @@ export async function replaceInSession(filePath, options = {}) {
     replacements,
     changedRecords,
     totalRecords: records.length,
+    scopedLines: lineScope ? lineScope.size : null,
     backup: null,
   };
 
@@ -696,15 +708,28 @@ export async function readSessionForEditing(filePath, options = {}) {
   const { lines, records } = await readJsonl(filePath);
   const includeJson = options.includeJson !== false;
   const maxJsonBytes = Number.isFinite(options.maxJsonBytes) ? options.maxJsonBytes : Infinity;
+  const turns = groupSessionTurns(records);
+  const turnByLine = new Map();
+  for (const turn of turns) {
+    for (let line = turn.startLine; line <= turn.endLine; line += 1) {
+      turnByLine.set(line, turn);
+    }
+  }
+
   return {
     summary,
     records: records.map((record, index) =>
-      describeRecord(record, index, {
-        includeJson,
-        maxJsonBytes,
-        raw: lines[index],
-      }),
+      annotateRecordTurn(
+        describeRecord(record, index, {
+          includeJson,
+          maxJsonBytes,
+          raw: lines[index],
+        }),
+        turnByLine.get(index + 1),
+        record,
+      ),
     ),
+    turns: turns.map(publicTurn),
   };
 }
 
@@ -785,6 +810,197 @@ export async function updateSessionRecord(filePath, lineNumber, nextRecord, opti
   return result;
 }
 
+export async function updateSessionRecords(filePath, updates, options = {}) {
+  if (!Array.isArray(updates)) {
+    throw new Error("Updates must be an array");
+  }
+
+  const dryRun = booleanOption(options, "dryRun", "dry-run");
+  const { records } = await readJsonl(filePath);
+  const nextRecords = records.slice();
+  const seen = new Set();
+  const normalized = [];
+
+  for (const update of updates) {
+    const line = Number.parseInt(String(update?.line), 10);
+    if (!Number.isInteger(line) || line < 1 || line > records.length) {
+      throw new Error(`Line ${line} is outside 1..${records.length}`);
+    }
+    if (seen.has(line)) {
+      throw new Error(`Line ${line} was updated more than once`);
+    }
+    if (!isPlainObject(update.record)) {
+      throw new Error("Session records must be JSON objects");
+    }
+
+    seen.add(line);
+    normalized.push({ line, record: update.record });
+    nextRecords[line - 1] = update.record;
+  }
+
+  normalized.sort((a, b) => a.line - b.line);
+  const result = {
+    file: filePath,
+    dryRun,
+    changedLines: normalized.map((update) => update.line),
+    changedRecords: normalized.length,
+    before: normalized.map((update) => describeRecord(records[update.line - 1], update.line - 1)),
+    after: normalized.map((update) => describeRecord(update.record, update.line - 1)),
+    backup: null,
+  };
+
+  if (!dryRun && normalized.length > 0) {
+    result.backup = await createBackup(filePath, {
+      managerHome: options.managerHome,
+      reason: options.reason || `update ${normalized.length} record(s)`,
+    });
+    await writeJsonlAtomic(filePath, nextRecords);
+  }
+
+  return result;
+}
+
+export async function truncateSessionAfterTurn(filePath, turnId, options = {}) {
+  const { records } = await readJsonl(filePath);
+  const turn = findSessionTurn(records, turnId);
+  if (!turn) {
+    throw new Error(`Unknown turn: ${turnId}`);
+  }
+  if (turn.kind === "setup") {
+    throw new Error("Setup records cannot be used as a rollback target");
+  }
+
+  const dryRun = booleanOption(options, "dryRun", "dry-run");
+  if (turn.endLine >= records.length) {
+    return {
+      file: filePath,
+      dryRun,
+      turn: publicTurn(turn),
+      removedLines: [],
+      beforeLines: records.length,
+      afterLines: records.length,
+      backup: null,
+    };
+  }
+
+  const result = await dropSessionLines(filePath, {
+    lines: `${turn.endLine + 1}-`,
+    managerHome: options.managerHome,
+    dryRun,
+    reason: `truncate after turn ${turn.index}`,
+  });
+  return { ...result, turn: publicTurn(turn) };
+}
+
+export function getSessionTurnEditPlan(records, turnId) {
+  const turn = findSessionTurn(records, turnId);
+  if (!turn) {
+    throw new Error(`Unknown turn: ${turnId}`);
+  }
+  if (turn.kind === "setup") {
+    return { turn: publicTurn(turn), groups: [] };
+  }
+
+  const groupsByKey = new Map();
+  for (let line = turn.startLine; line <= turn.endLine; line += 1) {
+    const record = records[line - 1];
+    for (const target of editableMessageTargets(record, line)) {
+      const key = `${target.side}\u0000${target.text}`;
+      let group = groupsByKey.get(key);
+      if (!group) {
+        group = {
+          id: "",
+          side: target.side,
+          text: target.text,
+          lines: [],
+          targetCount: 0,
+          targets: [],
+        };
+        groupsByKey.set(key, group);
+      }
+      group.lines.push(line);
+      group.targetCount += 1;
+      group.targets.push({
+        line,
+        path: target.path,
+        pathText: pathToString(target.path),
+      });
+    }
+  }
+
+  const groups = [...groupsByKey.values()].map((group) => {
+    const lines = [...new Set(group.lines)].sort((a, b) => a - b);
+    return {
+      id: turnMessageGroupId(turn.id, group.side, group.text, lines[0] || turn.startLine),
+      side: group.side,
+      text: group.text,
+      preview: oneLine(group.text, 180),
+      lines,
+      targetCount: group.targetCount,
+      targets: group.targets,
+    };
+  });
+
+  groups.sort((a, b) => a.lines[0] - b.lines[0] || a.side.localeCompare(b.side));
+  return { turn: publicTurn(turn), groups };
+}
+
+export async function updateSessionTurnMessages(filePath, turnId, edits, options = {}) {
+  if (!Array.isArray(edits)) {
+    throw new Error("Turn edits must be an array");
+  }
+
+  const { records } = await readJsonl(filePath);
+  const plan = getSessionTurnEditPlan(records, turnId);
+  const editsById = new Map();
+  for (const edit of edits) {
+    if (!edit || typeof edit.id !== "string") {
+      continue;
+    }
+    editsById.set(edit.id, typeof edit.text === "string" ? edit.text : "");
+  }
+
+  const nextByLine = new Map();
+  let changedGroups = 0;
+  let changedTargets = 0;
+
+  for (const group of plan.groups) {
+    if (!editsById.has(group.id)) {
+      continue;
+    }
+    const nextText = editsById.get(group.id);
+    if (nextText === group.text) {
+      continue;
+    }
+
+    changedGroups += 1;
+    for (const target of group.targets) {
+      const line = target.line;
+      const nextRecord = nextByLine.get(line) || cloneJson(records[line - 1]);
+      if (setPathValue(nextRecord, target.path, nextText)) {
+        changedTargets += 1;
+      }
+      nextByLine.set(line, nextRecord);
+    }
+  }
+
+  const updates = [...nextByLine.entries()]
+    .map(([line, record]) => ({ line, record }))
+    .sort((a, b) => a.line - b.line);
+  const result = await updateSessionRecords(filePath, updates, {
+    managerHome: options.managerHome,
+    dryRun: booleanOption(options, "dryRun", "dry-run"),
+    reason: `edit turn ${plan.turn.index}`,
+  });
+
+  return {
+    ...result,
+    turn: plan.turn,
+    changedGroups,
+    changedTargets,
+  };
+}
+
 export function describeRecord(record, index = 0, options = {}) {
   const payload = isPlainObject(record?.payload) ? record.payload : {};
   const type = textValue(record?.type) || "record";
@@ -808,6 +1024,244 @@ export function describeRecord(record, index = 0, options = {}) {
   }
 
   return result;
+}
+
+export function groupSessionTurns(records) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+
+  const turns = [];
+  let current = null;
+  let conversationIndex = 0;
+
+  function startTurn(line, record, kind) {
+    if (kind === "setup") {
+      current = {
+        id: "setup",
+        index: 0,
+        kind: "setup",
+        sourceTurnId: "",
+        startLine: line,
+        endLine: line,
+        lineCount: 0,
+        userText: "",
+        assistantText: "",
+        userTargetCount: 0,
+        assistantTargetCount: 0,
+        editableTargetCount: 0,
+        hasUser: false,
+        hasAssistant: false,
+      };
+    } else {
+      conversationIndex += 1;
+      current = {
+        id: `turn-${conversationIndex}`,
+        index: conversationIndex,
+        kind: "conversation",
+        sourceTurnId: recordTurnId(record),
+        startLine: line,
+        endLine: line,
+        lineCount: 0,
+        userText: "",
+        assistantText: "",
+        userTargetCount: 0,
+        assistantTargetCount: 0,
+        editableTargetCount: 0,
+        hasUser: false,
+        hasAssistant: false,
+      };
+    }
+    turns.push(current);
+  }
+
+  for (let index = 0; index < records.length; index += 1) {
+    const line = index + 1;
+    const record = records[index];
+    if (recordStartsTask(record)) {
+      startTurn(line, record, "conversation");
+    } else if (!current) {
+      startTurn(line, record, recordStartsFallbackUserTurn(record) ? "conversation" : "setup");
+    } else if (recordStartsFallbackUserTurn(record) && shouldStartFallbackTurn(current)) {
+      startTurn(line, record, "conversation");
+    }
+
+    current.endLine = line;
+    current.lineCount += 1;
+    if (!current.sourceTurnId) {
+      current.sourceTurnId = recordTurnId(record);
+    }
+
+    for (const target of editableMessageTargets(record, line)) {
+      current.editableTargetCount += 1;
+      if (target.side === "user") {
+        current.userTargetCount += 1;
+        current.hasUser = true;
+        if (!current.userText && target.text.trim()) {
+          current.userText = target.text;
+        }
+      } else if (target.side === "assistant") {
+        current.assistantTargetCount += 1;
+        current.hasAssistant = true;
+        if (target.text.trim()) {
+          current.assistantText = target.text;
+        }
+      }
+    }
+  }
+
+  return turns;
+}
+
+function annotateRecordTurn(record, turn, sourceRecord) {
+  if (!turn) {
+    return record;
+  }
+  const messageSide = messageSideForRecord(sourceRecord);
+  return {
+    ...record,
+    turnId: turn.id,
+    turnIndex: turn.index,
+    turnKind: turn.kind,
+    turnLabel: turn.kind === "setup" ? "Setup" : `Turn ${turn.index}`,
+    turnStartLine: turn.startLine,
+    turnEndLine: turn.endLine,
+    messageSide,
+  };
+}
+
+function publicTurn(turn) {
+  return {
+    id: turn.id,
+    index: turn.index,
+    kind: turn.kind,
+    label: turn.kind === "setup" ? "Setup" : `Turn ${turn.index}`,
+    sourceTurnId: turn.sourceTurnId,
+    startLine: turn.startLine,
+    endLine: turn.endLine,
+    lineCount: turn.lineCount,
+    userText: oneLine(turn.userText, 180),
+    assistantText: oneLine(turn.assistantText, 180),
+    userTargetCount: turn.userTargetCount,
+    assistantTargetCount: turn.assistantTargetCount,
+    editableTargetCount: turn.editableTargetCount,
+  };
+}
+
+function findSessionTurn(records, turnId) {
+  return groupSessionTurns(records).find((turn) => turn.id === turnId || turn.sourceTurnId === turnId);
+}
+
+function recordStartsTask(record) {
+  const payload = isPlainObject(record?.payload) ? record.payload : {};
+  return textValue(record?.type) === "event_msg" && textValue(payload.type) === "task_started";
+}
+
+function recordStartsFallbackUserTurn(record) {
+  return editableMessageTargets(record, 1).some((target) => target.side === "user");
+}
+
+function shouldStartFallbackTurn(current) {
+  if (!current || current.kind === "setup") {
+    return true;
+  }
+  return current.hasUser && current.hasAssistant;
+}
+
+function recordTurnId(record) {
+  const payload = isPlainObject(record?.payload) ? record.payload : {};
+  return textValue(payload.turn_id || record?.turn_id);
+}
+
+function editableMessageTargets(record, line) {
+  const payload = isPlainObject(record?.payload) ? record.payload : {};
+  const recordType = textValue(record?.type);
+  const payloadType = textValue(payload.type);
+  const targets = [];
+
+  function add(side, pathParts, value) {
+    if ((side !== "user" && side !== "assistant") || typeof value !== "string") {
+      return;
+    }
+    targets.push({
+      line,
+      side,
+      path: pathParts,
+      text: value,
+    });
+  }
+
+  if (recordType === "event_msg") {
+    if (payloadType === "user_message") {
+      add("user", ["payload", "message"], payload.message);
+      add("user", ["payload", "text"], payload.text);
+    } else if (payloadType === "agent_message") {
+      add("assistant", ["payload", "message"], payload.message);
+      add("assistant", ["payload", "text"], payload.text);
+    } else if (payloadType === "task_complete") {
+      add("assistant", ["payload", "last_agent_message"], payload.last_agent_message);
+      add("assistant", ["payload", "message"], payload.message);
+      add("assistant", ["payload", "text"], payload.text);
+    }
+  }
+
+  if (recordType === "response_item" && payloadType === "message") {
+    const role = textValue(payload.role || record?.role).toLowerCase();
+    if (role === "user" || role === "assistant") {
+      add(role, ["payload", "message"], payload.message);
+      add(role, ["payload", "text"], payload.text);
+      if (Array.isArray(payload.content)) {
+        payload.content.forEach((item, index) => {
+          if (isPlainObject(item)) {
+            add(role, ["payload", "content", index, "text"], item.text);
+          }
+        });
+      }
+    }
+  }
+
+  return targets;
+}
+
+function messageSideForRecord(record) {
+  const targets = editableMessageTargets(record, 1);
+  if (targets.some((target) => target.side === "user")) {
+    return "user";
+  }
+  if (targets.some((target) => target.side === "assistant")) {
+    return "assistant";
+  }
+  return "";
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function setPathValue(target, pathParts, value) {
+  let current = target;
+  for (let index = 0; index < pathParts.length - 1; index += 1) {
+    current = current?.[pathParts[index]];
+    if (current === undefined || current === null) {
+      return false;
+    }
+  }
+  const key = pathParts[pathParts.length - 1];
+  if (typeof current?.[key] !== "string") {
+    return false;
+  }
+  current[key] = value;
+  return true;
+}
+
+function turnMessageGroupId(turnId, side, text, firstLine) {
+  return `${side}-${firstLine}-${shortHash(`${turnId}\u0000${side}\u0000${text}\u0000${firstLine}`)}`;
+}
+
+function pathToString(pathParts) {
+  return pathParts
+    .map((part) => (typeof part === "number" ? `[${part}]` : String(part)))
+    .join(".");
 }
 
 export function sessionIsActive(session, windowMinutes = 10, now = Date.now()) {

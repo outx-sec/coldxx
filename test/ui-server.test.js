@@ -52,6 +52,12 @@ test("ui server lists sessions and updates one record", async (t) => {
   assert.match(html, /large-json/);
   assert.match(html, /MAX_WRAPPED_JSON_CHARS/);
   assert.match(html, /MAX_JSON_AUTOLOAD_BYTES/);
+  assert.match(html, /data-edit-turn/);
+  assert.match(html, /data-truncate-turn/);
+  assert.match(html, /turn-edit-section/);
+  assert.match(html, /modalReplaceEnabled/);
+  assert.match(html, /modalReplaceCaseSensitive/);
+  assert.match(html, /modalFilterRegex/);
 
   const sessionsResponse = await fetch(`${origin}/api/sessions`, { headers });
   assert.equal(sessionsResponse.status, 200);
@@ -65,6 +71,8 @@ test("ui server lists sessions and updates one record", async (t) => {
   assert.equal(recordsResponse.status, 200);
   const recordsBody = await recordsResponse.json();
   assert.equal(recordsBody.records.length, 4);
+  assert.equal(recordsBody.turns.length, 2);
+  assert.equal(recordsBody.turns[1].userTargetCount, 1);
   assert.equal(Object.hasOwn(recordsBody.records[0], "json"), true);
 
   const recordResponse = await fetch(`${origin}/api/sessions/${encodeURIComponent(session.id)}/records/3`, {
@@ -73,7 +81,7 @@ test("ui server lists sessions and updates one record", async (t) => {
   assert.equal(recordResponse.status, 200);
   const recordBody = await recordResponse.json();
   assert.equal(recordBody.record.line, 3);
-  assert.match(recordBody.record.json, /hello secret/);
+  assert.match(recordBody.record.json, /hello marker/);
 
   const updateResponse = await fetch(`${origin}/api/sessions/${encodeURIComponent(session.id)}/records/3`, {
     method: "PUT",
@@ -114,7 +122,34 @@ test("ui server lists sessions and updates one record", async (t) => {
   );
   assert.equal(rollbackResponse.status, 200);
   const restored = await readJsonl(sessionPath);
-  assert.equal(restored.records[2].payload.content[0].text, "hello secret");
+  assert.equal(restored.records[2].payload.content[0].text, "hello marker");
+
+  const turnPlanResponse = await fetch(
+    `${origin}/api/sessions/${encodeURIComponent(session.id)}/turns/turn-1/edit`,
+    { headers },
+  );
+  assert.equal(turnPlanResponse.status, 200);
+  const turnPlan = await turnPlanResponse.json();
+  assert.equal(turnPlan.groups.length, 2);
+
+  const turnEditResponse = await fetch(
+    `${origin}/api/sessions/${encodeURIComponent(session.id)}/turns/turn-1/edit`,
+    {
+      method: "PUT",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({
+        allowActive: true,
+        edits: turnPlan.groups.map((group) => ({
+          id: group.id,
+          text: group.side === "user" ? "turn user edited through ui" : "turn assistant edited through ui",
+        })),
+      }),
+    },
+  );
+  assert.equal(turnEditResponse.status, 200);
+  const turnEdited = await readJsonl(sessionPath);
+  assert.equal(turnEdited.records[2].payload.content[0].text, "turn user edited through ui");
+  assert.equal(turnEdited.records[3].payload.content[0].text, "turn assistant edited through ui");
 
   const cleanResponse = await fetch(`${origin}/api/sessions/clean`, {
     method: "POST",
@@ -148,14 +183,14 @@ async function fixture() {
   const sessionDir = path.join(codexHome, "sessions", "2026", "04", "28");
   const sessionPath = path.join(
     sessionDir,
-    "rollout-2026-04-28T17-29-46-019dd36c-584b-79d2-9a73-db43acc986e0.jsonl",
+    "rollout-2026-04-28T17-29-46-a1111111-2222-4333-8444-555555555555.jsonl",
   );
   const records = [
     {
       timestamp: "2026-04-28T17:29:46.000Z",
       type: "session_meta",
       payload: {
-        id: "019dd36c-584b-79d2-9a73-db43acc986e0",
+        id: "a1111111-2222-4333-8444-555555555555",
         timestamp: "2026-04-28T17:29:46.000Z",
         cwd: "/work/project",
         cli_version: "0.0.0-test",
@@ -173,7 +208,7 @@ async function fixture() {
       payload: {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: "hello secret" }],
+        content: [{ type: "input_text", text: "hello marker" }],
       },
     },
     {

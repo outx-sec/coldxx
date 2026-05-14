@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="coldxx logo">
+  <defs>
+    <linearGradient id="coldxx-bg" x1="14" y1="12" x2="82" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10242b"/>
+      <stop offset="1" stop-color="#0d6b60"/>
+    </linearGradient>
+    <linearGradient id="coldxx-line" x1="20" y1="18" x2="76" y2="78" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f7fffb"/>
+      <stop offset="1" stop-color="#9fd6ca"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="20" fill="url(#coldxx-bg)"/>
+  <path d="M34 31 20 48l14 17" fill="none" stroke="url(#coldxx-line)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M60 33 76 63M76 33 60 63" fill="none" stroke="#d8f4eb" stroke-width="7" stroke-linecap="round"/>
+  <path d="M43 67h15" fill="none" stroke="#75bfb2" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="48" cy="48" r="5" fill="#ffffff"/>
+</svg>

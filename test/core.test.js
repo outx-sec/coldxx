@@ -6,6 +6,8 @@ import os from "node:os";
 import {
   cleanSessions,
   dropSessionLines,
+  getSessionTurnEditPlan,
+  groupSessionTurns,
   listBackups,
   listTrash,
   parseLineRanges,
@@ -16,7 +18,9 @@ import {
   restoreTrashBatch,
   scanSessions,
   sessionIsActive,
+  truncateSessionAfterTurn,
   updateSessionRecord,
+  updateSessionTurnMessages,
 } from "../src/core.js";
 
 test("scanSessions reads Codex JSONL metadata", async () => {
@@ -25,10 +29,10 @@ test("scanSessions reads Codex JSONL metadata", async () => {
   const sessions = await scanSessions({ codexHome });
 
   assert.equal(sessions.length, 1);
-  assert.equal(sessions[0].id, "019dd36c-584b-79d2-9a73-db43acc986e0");
+  assert.equal(sessions[0].id, "a1111111-2222-4333-8444-555555555555");
   assert.equal(sessions[0].cwd, "/work/project");
   assert.equal(sessions[0].lines, 4);
-  assert.match(sessions[0].preview, /hello secret/);
+  assert.match(sessions[0].preview, /hello marker/);
 });
 
 test("scanSessions keeps fork session id separate from embedded parent metadata", async () => {
@@ -51,7 +55,7 @@ test("resolveSessionSelectors supports latest, index, id prefix, and path", asyn
 
   assert.equal(resolveSessionSelectors(sessions, ["latest"])[0].file, sessionPath);
   assert.equal(resolveSessionSelectors(sessions, ["1"])[0].file, sessionPath);
-  assert.equal(resolveSessionSelectors(sessions, ["019dd36c"])[0].file, sessionPath);
+  assert.equal(resolveSessionSelectors(sessions, ["a1111111"])[0].file, sessionPath);
   assert.equal(resolveSessionSelectors(sessions, [sessionPath])[0].file, sessionPath);
 });
 
@@ -59,7 +63,7 @@ test("replaceInSession edits scoped text and creates a backup", async () => {
   const { sessionPath, managerHome } = await fixture();
 
   const result = await replaceInSession(sessionPath, {
-    from: "secret",
+    from: "marker",
     to: "[REDACTED]",
     scope: "user",
     managerHome,
@@ -70,7 +74,61 @@ test("replaceInSession edits scoped text and creates a backup", async () => {
 
   const { raw } = await readJsonl(sessionPath);
   assert.match(raw, /\[REDACTED\]/);
-  assert.doesNotMatch(raw, /hello secret/);
+  assert.doesNotMatch(raw, /hello marker/);
+});
+
+test("replaceInSession honors case sensitivity and regex matching", async () => {
+  const insensitive = await fixture();
+  const caseResult = await replaceInSession(insensitive.sessionPath, {
+    from: "HELLO MARKER",
+    to: "case matched",
+    scope: "user",
+    caseSensitive: false,
+    managerHome: insensitive.managerHome,
+  });
+  assert.equal(caseResult.replacements, 1);
+
+  const strict = await fixture();
+  const strictResult = await replaceInSession(strict.sessionPath, {
+    from: "HELLO MARKER",
+    to: "case matched",
+    scope: "user",
+    caseSensitive: true,
+    managerHome: strict.managerHome,
+  });
+  assert.equal(strictResult.replacements, 0);
+
+  const regex = await fixture();
+  const regexResult = await replaceInSession(regex.sessionPath, {
+    from: "hello\\s+mark[a-z]+",
+    to: "regex matched",
+    scope: "user",
+    regex: true,
+    caseSensitive: true,
+    managerHome: regex.managerHome,
+  });
+  assert.equal(regexResult.replacements, 1);
+  const { raw } = await readJsonl(regex.sessionPath);
+  assert.match(raw, /regex matched/);
+});
+
+test("replaceInSession can limit replacements to selected lines", async () => {
+  const { sessionPath, managerHome } = await fixture();
+
+  const result = await replaceInSession(sessionPath, {
+    from: "hello",
+    to: "line scoped",
+    scope: "all",
+    lines: [4],
+    managerHome,
+  });
+
+  assert.equal(result.replacements, 1);
+  assert.equal(result.scopedLines, 1);
+
+  const { records } = await readJsonl(sessionPath);
+  assert.equal(records[2].payload.content[0].text, "hello marker");
+  assert.equal(records[3].payload.content[0].text, "line scoped user");
 });
 
 test("dropSessionLines removes selected 1-based records", async () => {
@@ -127,7 +185,72 @@ test("updateSessionRecord replaces one JSONL record and creates a backup", async
   assert.ok(restoreResult.backup.backupPath);
 
   const restored = await readJsonl(sessionPath);
-  assert.equal(restored.records[2].payload.content[0].text, "hello secret");
+  assert.equal(restored.records[2].payload.content[0].text, "hello marker");
+});
+
+test("groupSessionTurns and getSessionTurnEditPlan expose editable conversation groups", async () => {
+  const { sessionPath } = await turnFixture();
+  const { records } = await readJsonl(sessionPath);
+
+  const turns = groupSessionTurns(records);
+  assert.equal(turns.length, 3);
+  assert.equal(turns[0].kind, "setup");
+  assert.equal(turns[1].sourceTurnId, "turn-a");
+  assert.equal(turns[1].startLine, 2);
+  assert.equal(turns[1].endLine, 8);
+  assert.equal(turns[1].userTargetCount, 2);
+  assert.equal(turns[1].assistantTargetCount, 3);
+
+  const plan = getSessionTurnEditPlan(records, "turn-1");
+  assert.equal(plan.groups.length, 2);
+  assert.equal(plan.groups.find((group) => group.side === "user").targetCount, 2);
+  assert.equal(plan.groups.find((group) => group.side === "assistant").targetCount, 3);
+});
+
+test("updateSessionTurnMessages edits duplicate turn messages with one backup", async () => {
+  const { sessionPath, managerHome } = await turnFixture();
+  const { records } = await readJsonl(sessionPath);
+  const plan = getSessionTurnEditPlan(records, "turn-1");
+
+  const result = await updateSessionTurnMessages(
+    sessionPath,
+    "turn-1",
+    plan.groups.map((group) => ({
+      id: group.id,
+      text: group.side === "user" ? "new user text" : "new assistant text",
+    })),
+    { managerHome },
+  );
+
+  assert.equal(result.changedGroups, 2);
+  assert.equal(result.changedTargets, 5);
+  assert.deepEqual(result.changedLines, [4, 5, 6, 7, 8]);
+
+  const updated = await readJsonl(sessionPath);
+  assert.equal(updated.records[3].payload.content[0].text, "new user text");
+  assert.equal(updated.records[4].payload.message, "new user text");
+  assert.equal(updated.records[5].payload.message, "new assistant text");
+  assert.equal(updated.records[6].payload.content[0].text, "new assistant text");
+  assert.equal(updated.records[7].payload.last_agent_message, "new assistant text");
+  assert.equal(updated.records[9].payload.content[0].text, "later user");
+
+  const backups = await listBackups({ managerHome, originalPath: sessionPath });
+  assert.equal(backups.length, 1);
+  assert.equal(backups[0].reason, "edit turn 1");
+});
+
+test("truncateSessionAfterTurn deletes records after the selected turn", async () => {
+  const { sessionPath, managerHome } = await turnFixture();
+
+  const result = await truncateSessionAfterTurn(sessionPath, "turn-1", { managerHome });
+
+  assert.deepEqual(result.removedLines, [9, 10]);
+  assert.equal(result.beforeLines, 10);
+  assert.equal(result.afterLines, 8);
+
+  const { records } = await readJsonl(sessionPath);
+  assert.equal(records.length, 8);
+  assert.equal(records.at(-1).payload.last_agent_message, "old assistant");
 });
 
 test("cleanSessions moves sessions to trash and restoreTrashBatch restores them", async () => {
@@ -177,14 +300,14 @@ async function fixture() {
   const sessionDir = path.join(codexHome, "sessions", "2026", "04", "28");
   const sessionPath = path.join(
     sessionDir,
-    "rollout-2026-04-28T17-29-46-019dd36c-584b-79d2-9a73-db43acc986e0.jsonl",
+    "rollout-2026-04-28T17-29-46-a1111111-2222-4333-8444-555555555555.jsonl",
   );
   const records = [
     {
       timestamp: "2026-04-28T17:29:46.000Z",
       type: "session_meta",
       payload: {
-        id: "019dd36c-584b-79d2-9a73-db43acc986e0",
+        id: "a1111111-2222-4333-8444-555555555555",
         timestamp: "2026-04-28T17:29:46.000Z",
         cwd: "/work/project",
         cli_version: "0.0.0-test",
@@ -202,7 +325,7 @@ async function fixture() {
       payload: {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: "hello secret" }],
+        content: [{ type: "input_text", text: "hello marker" }],
       },
     },
     {
@@ -222,12 +345,100 @@ async function fixture() {
   return { root, codexHome, managerHome, sessionPath };
 }
 
+async function turnFixture() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "coldxx-turn-test-"));
+  const codexHome = path.join(root, ".codex");
+  const managerHome = path.join(root, ".manager");
+  const sessionDir = path.join(codexHome, "sessions", "2026", "04", "28");
+  const sessionPath = path.join(
+    sessionDir,
+    "rollout-2026-04-28T17-29-46-a1111111-2222-4333-8444-555555555555.jsonl",
+  );
+  const records = [
+    {
+      timestamp: "2026-04-28T17:29:46.000Z",
+      type: "session_meta",
+      payload: {
+        id: "a1111111-2222-4333-8444-555555555555",
+        timestamp: "2026-04-28T17:29:46.000Z",
+        cwd: "/work/project",
+      },
+    },
+    {
+      timestamp: "2026-04-28T17:29:47.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-a", started_at: "2026-04-28T17:29:47.000Z" },
+    },
+    {
+      timestamp: "2026-04-28T17:29:47.500Z",
+      type: "turn_context",
+      payload: { turn_id: "turn-a", cwd: "/work/project", model: "gpt-test" },
+    },
+    {
+      timestamp: "2026-04-28T17:29:48.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "old user" }],
+      },
+    },
+    {
+      timestamp: "2026-04-28T17:29:48.100Z",
+      type: "event_msg",
+      payload: { type: "user_message", turn_id: "turn-a", message: "old user" },
+    },
+    {
+      timestamp: "2026-04-28T17:29:49.000Z",
+      type: "event_msg",
+      payload: { type: "agent_message", turn_id: "turn-a", message: "old assistant" },
+    },
+    {
+      timestamp: "2026-04-28T17:29:49.100Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "old assistant" }],
+      },
+    },
+    {
+      timestamp: "2026-04-28T17:29:50.000Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-a",
+        last_agent_message: "old assistant",
+      },
+    },
+    {
+      timestamp: "2026-04-28T17:30:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-b", started_at: "2026-04-28T17:30:00.000Z" },
+    },
+    {
+      timestamp: "2026-04-28T17:30:01.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "later user" }],
+      },
+    },
+  ];
+
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(sessionPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+  return { root, codexHome, managerHome, sessionPath };
+}
+
 async function forkFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "coldxx-fork-test-"));
   const codexHome = path.join(root, ".codex");
   const sessionDir = path.join(codexHome, "sessions", "2026", "04", "25");
-  const parentId = "019dc22e-52f7-71f0-b2ba-780084c3555b";
-  const forkId = "019dc23d-64fd-72d1-8082-74c9a3e46fc8";
+  const parentId = "b2222222-3333-4444-8555-666666666666";
+  const forkId = "c3333333-4444-4555-8666-777777777777";
   const parentPath = path.join(sessionDir, `rollout-2026-04-25T09-08-29-${parentId}.jsonl`);
   const forkPath = path.join(sessionDir, `rollout-2026-04-25T09-24-56-${forkId}.jsonl`);
 

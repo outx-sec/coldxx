@@ -5,8 +5,10 @@ import {
   dropSessionLines,
   emptyTrash,
   formatBytes,
+  getSessionTurnEditPlan,
   listBackups,
   listTrash,
+  readJsonl,
   readSessionForEditing,
   readSessionRecordForEditing,
   replaceInSession,
@@ -17,12 +19,31 @@ import {
   restoreTrashBatch,
   scanSessions,
   sessionIsActive,
+  truncateSessionAfterTurn,
   updateSessionRecord,
+  updateSessionTurnMessages,
 } from "./core.js";
 
 const DEFAULT_ACTIVE_WINDOW_MINUTES = 10;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const MAX_INLINE_RECORD_JSON_BYTES = 256 * 1024;
+const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="coldxx logo">
+  <defs>
+    <linearGradient id="coldxx-bg" x1="14" y1="12" x2="82" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10242b"/>
+      <stop offset="1" stop-color="#0d6b60"/>
+    </linearGradient>
+    <linearGradient id="coldxx-line" x1="20" y1="18" x2="76" y2="78" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f7fffb"/>
+      <stop offset="1" stop-color="#9fd6ca"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="20" fill="url(#coldxx-bg)"/>
+  <path d="M34 31 20 48l14 17" fill="none" stroke="url(#coldxx-line)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M60 33 76 63M76 33 60 63" fill="none" stroke="#d8f4eb" stroke-width="7" stroke-linecap="round"/>
+  <path d="M43 67h15" fill="none" stroke="#75bfb2" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="48" cy="48" r="5" fill="#ffffff"/>
+</svg>`;
 
 export async function startUiServer(options = {}) {
   const codexHome = resolveCodexHome(options.codexHome);
@@ -71,6 +92,11 @@ async function route(req, res, state) {
 
   if (req.method === "GET" && url.pathname === "/") {
     sendHtml(res, html(state));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/assets/coldxx-logo.svg") {
+    sendSvg(res, LOGO_SVG);
     return;
   }
 
@@ -177,6 +203,42 @@ async function route(req, res, state) {
     return;
   }
 
+  const turnMatch = /^\/api\/sessions\/([^/]+)\/turns\/([^/]+)\/(edit|truncate)$/.exec(url.pathname);
+  if (turnMatch) {
+    const session = await resolveSession(decodeURIComponent(turnMatch[1]), state);
+    const turnId = decodeURIComponent(turnMatch[2]);
+    const action = turnMatch[3];
+
+    if (req.method === "GET" && action === "edit") {
+      const { records } = await readJsonl(session.file);
+      sendJson(res, 200, getSessionTurnEditPlan(records, turnId));
+      return;
+    }
+
+    if (req.method === "PUT" && action === "edit") {
+      const body = await readJsonBody(req);
+      guardActiveSession(session, state, body.allowActive, "edit this conversation turn");
+      const result = await updateSessionTurnMessages(session.file, turnId, Array.isArray(body.edits) ? body.edits : [], {
+        managerHome: state.managerHome,
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && action === "truncate") {
+      const body = await readJsonBody(req);
+      guardActiveSession(session, state, body.allowActive, "truncate this session");
+      const result = await truncateSessionAfterTurn(session.file, turnId, {
+        managerHome: state.managerHome,
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   const match = /^\/api\/sessions\/([^/]+)(?:\/(records|replace|drop|clean)(?:\/(\d+))?)?$/.exec(url.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
@@ -208,6 +270,7 @@ async function route(req, res, state) {
     sendJson(res, 200, {
       session: publicSession({ ...session, ...sessionForEditing.summary }, state),
       records: sessionForEditing.records,
+      turns: sessionForEditing.turns,
     });
     return;
   }
@@ -233,6 +296,7 @@ async function route(req, res, state) {
       regex: Boolean(body.regex),
       flags: body.flags || "",
       caseSensitive: Boolean(body.caseSensitive),
+      lines: Array.isArray(body.lines) ? body.lines : undefined,
       managerHome: state.managerHome,
     });
     sendJson(res, 200, result);
@@ -367,6 +431,15 @@ function sendHtml(res, body) {
   res.end(body);
 }
 
+function sendSvg(res, body) {
+  res.writeHead(200, {
+    "content-type": "image/svg+xml; charset=utf-8",
+    "cache-control": "public, max-age=86400",
+    "x-content-type-options": "nosniff",
+  });
+  res.end(body);
+}
+
 function html(state) {
   const boot = JSON.stringify({
     token: state.token,
@@ -496,8 +569,19 @@ function html(state) {
       font-size: 12px;
     }
 
+    button.icon.compact {
+      width: 30px;
+      padding: 0;
+    }
+
     button.ghost {
       background: transparent;
+    }
+
+    button.active {
+      color: var(--accent);
+      border-color: rgba(13, 107, 96, 0.35);
+      background: var(--accent-soft);
     }
 
     button:disabled {
@@ -542,19 +626,26 @@ function html(state) {
     .app {
       height: 100vh;
       display: grid;
-      grid-template-rows: 52px 1fr;
+      grid-template-rows: 64px 1fr;
     }
 
     .topbar {
       display: grid;
-      grid-template-columns: minmax(160px, 240px) minmax(220px, 1fr) auto;
+      grid-template-columns: minmax(160px, 240px) minmax(220px, 1fr);
       align-items: center;
       gap: 12px;
       border-bottom: 1px solid var(--line);
       background: rgba(252, 253, 251, 0.92);
       backdrop-filter: blur(12px);
-      padding: 0 16px;
+      padding: 7px 16px;
       box-shadow: 0 1px 0 rgba(255, 255, 255, 0.75) inset;
+    }
+
+    .brand-stack {
+      min-width: 0;
+      display: grid;
+      align-content: center;
+      gap: 5px;
     }
 
     .top-actions {
@@ -570,15 +661,23 @@ function html(state) {
       letter-spacing: 0;
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 9px;
+      line-height: 1;
     }
 
     .brand-mark {
-      width: 20px;
-      height: 20px;
-      border-radius: 6px;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45);
+      width: 25px;
+      height: 25px;
+      border-radius: 7px;
+      overflow: hidden;
+      box-shadow: 0 1px 2px rgba(15, 31, 37, 0.16);
+      flex: 0 0 auto;
+    }
+
+    .brand-mark img {
+      display: block;
+      width: 100%;
+      height: 100%;
     }
 
     .pathline {
@@ -587,19 +686,7 @@ function html(state) {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-    }
-
-    .searchbar {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      min-width: 0;
-    }
-
-    .searchbar input {
-      width: min(420px, 100%);
-      min-width: 120px;
-      font-size: 13px;
+      line-height: 1.25;
     }
 
     .workspace {
@@ -690,6 +777,82 @@ function html(state) {
       font-size: 13px;
     }
 
+    .section-title-row {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .session-title-tools {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .session-head-main {
+      min-width: 0;
+      width: 100%;
+      display: grid;
+      gap: 5px;
+    }
+
+    .session-search-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .session-search-row[hidden] {
+      display: none;
+    }
+
+    .session-search-row input {
+      width: 100%;
+      min-width: 0;
+      height: 30px;
+      font-size: 12px;
+    }
+
+    .help-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      border: 1px solid var(--line-strong);
+      background: #fff;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: help;
+      flex: 0 0 auto;
+    }
+
+    .help-icon:hover,
+    .help-icon:focus-visible {
+      color: var(--accent);
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    .button-icon {
+      display: block;
+      width: 16px;
+      height: 16px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
     .meta {
       color: var(--muted);
       font-size: 12px;
@@ -715,10 +878,210 @@ function html(state) {
       flex: 1;
     }
 
+    .turn-list {
+      flex: 1 1 auto;
+      min-height: 150px;
+      overflow: auto;
+      padding: 8px 10px;
+      display: grid;
+      align-content: start;
+      gap: 8px;
+      background: #fbfcfc;
+      border-bottom: 1px solid var(--line);
+      scrollbar-width: thin;
+      scrollbar-color: #a9b9bc transparent;
+    }
+
+    .turn-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      min-height: 86px;
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--accent);
+      border-radius: 7px;
+      padding: 9px 10px;
+      background: #fff;
+      cursor: pointer;
+      transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+    }
+
+    .turn-item:hover {
+      background: #f8faf9;
+      border-color: #c5d1d3;
+    }
+
+    .turn-item.active {
+      background: var(--accent-soft);
+      border-color: #a9cbc4;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
+    }
+
+    .turn-item-main {
+      min-width: 0;
+      display: grid;
+      gap: 5px;
+    }
+
+    .turn-item-head {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .turn-item-title {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #24343b;
+      font-weight: 650;
+      font-size: 12px;
+    }
+
+    .turn-line-meta {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .turn-messages {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .turn-message {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      gap: 7px;
+      color: #3b4a51;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .turn-message b {
+      color: #66747b;
+      font-weight: 650;
+    }
+
+    .turn-message span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .turn-item-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .turn-action-mark {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .record-detail {
+      flex: 0 0 auto;
+      min-height: 38px;
+      max-height: 38px;
+      display: flex;
+      flex-direction: column;
+      background: #f7faf9;
+      border-bottom: 1px solid var(--line);
+      overflow: hidden;
+      transition: max-height 180ms ease, flex-basis 180ms ease;
+    }
+
+    .record-detail.open {
+      flex: 0 0 38%;
+      min-height: 180px;
+      max-height: 48%;
+    }
+
+    .record-detail.open .history-caret {
+      transform: rotate(225deg);
+    }
+
+    .record-detail:not(.open) .line-tools,
+    .record-detail:not(.open) .record-list {
+      display: none;
+    }
+
+    .record-detail-head {
+      width: 100%;
+      height: 38px;
+      min-height: 38px;
+      border: 0;
+      border-radius: 0;
+      padding: 0 12px;
+      background: linear-gradient(180deg, #fff, #f7faf9);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      text-align: left;
+    }
+
+    .record-detail-title {
+      display: block;
+      color: #405058;
+      font-size: 12px;
+      font-weight: 650;
+      line-height: 1.2;
+    }
+
+    .record-detail-meta {
+      display: block;
+      min-width: 0;
+      margin-top: 1px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .line-tools {
+      min-height: 40px;
+      padding: 6px 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfc;
+    }
+
+    .line-tools input[type="text"] {
+      width: 88px;
+      min-width: 72px;
+      flex: 0 0 88px;
+      height: 30px;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+
     .session-actions {
+      width: 100%;
+      align-self: stretch;
       display: flex;
       gap: 6px;
       align-items: center;
+      justify-content: flex-start;
       flex-wrap: wrap;
       padding: 8px 10px;
       border-bottom: 1px solid var(--line);
@@ -1132,9 +1495,34 @@ function html(state) {
       background: #f8faf9;
     }
 
+    tr.record-row.turn-shade-1 td {
+      background: #fcfbf6;
+    }
+
+    tr.record-row.turn-shade-1:hover td,
+    tr.record-row:hover td {
+      background: #f7faf9;
+    }
+
+    tr.record-row.side-user td.line-col {
+      box-shadow: inset 3px 0 0 rgba(13, 107, 96, 0.42);
+    }
+
+    tr.record-row.side-assistant td.line-col {
+      box-shadow: inset 3px 0 0 rgba(55, 95, 148, 0.42);
+    }
+
     tr.selected td {
       background: #e7f0f5;
       box-shadow: inset 3px 0 0 var(--accent-2);
+    }
+
+    tr.focused-line td {
+      background: #fff7e6;
+    }
+
+    tr.focused-line td.line-col {
+      box-shadow: inset 3px 0 0 var(--warn);
     }
 
     .record-kind {
@@ -1505,6 +1893,15 @@ function html(state) {
       box-shadow: 0 24px 80px rgba(16, 24, 30, 0.28), 0 2px 10px rgba(16, 24, 30, 0.12);
     }
 
+    .modal-layer.wide .modal {
+      width: min(860px, calc(100vw - 36px));
+      max-height: min(86vh, 820px);
+    }
+
+    .modal-layer.wide .modal-body {
+      padding: 16px 18px;
+    }
+
     .modal-head {
       display: flex;
       align-items: start;
@@ -1595,9 +1992,24 @@ function html(state) {
     }
 
     .modal-field input,
-    .modal-field select {
+    .modal-field select,
+    .modal-field textarea {
       width: 100%;
       font-size: 13px;
+    }
+
+    .modal-field textarea {
+      min-height: 112px;
+      max-height: 260px;
+      resize: vertical;
+      line-height: 1.45;
+      padding: 8px 9px;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .modal-layer.wide .modal-field textarea {
+      min-height: 156px;
+      max-height: 360px;
     }
 
     .modal-field select[multiple] {
@@ -1644,6 +2056,23 @@ function html(state) {
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
+    }
+
+    .turn-edit-section {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .turn-edit-section-title {
+      color: #405058;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .turn-edit-target {
+      color: var(--muted);
+      font-weight: 400;
     }
 
     .modal-error {
@@ -1724,19 +2153,28 @@ function html(state) {
         min-height: 360px;
         border-radius: 8px;
       }
+
+      .turn-item {
+        grid-template-columns: 1fr;
+      }
+
+      .turn-item-actions {
+        justify-content: flex-start;
+      }
+
+      .record-detail.open {
+        flex-basis: 46%;
+        max-height: 52%;
+      }
     }
   </style>
 </head>
 <body>
   <div class="app">
     <header class="topbar">
-      <div>
-        <div class="brand"><span class="brand-mark"></span><span>coldxx</span></div>
+      <div class="brand-stack">
+        <div class="brand"><span class="brand-mark"><img src="/assets/coldxx-logo.svg" alt=""></span><span>coldxx</span></div>
         <div class="pathline" id="pathline"></div>
-      </div>
-      <div class="searchbar">
-        <input id="sessionSearch" placeholder="Search sessions" autocomplete="off">
-        <button class="icon" id="refreshSessions" title="刷新 sessions" aria-label="刷新 sessions">↻</button>
       </div>
       <div class="top-actions">
         <button class="compact" id="resetLayoutButton" title="恢复默认栏宽和 Trash 高度">重置布局</button>
@@ -1746,9 +2184,28 @@ function html(state) {
     <main class="workspace" id="workspace">
       <aside class="sessions">
         <div class="section-head">
-          <div>
-            <div class="section-title">Sessions</div>
+          <div class="session-head-main">
+            <div class="section-title-row">
+              <div class="section-title">Sessions</div>
+              <div class="session-title-tools">
+                <button class="icon compact" id="toggleSessionSearchButton" title="搜索 session id、cwd、文件路径、预览文本和 model" aria-label="展开 session 搜索" aria-expanded="false">
+                  <svg class="button-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <circle cx="8.5" cy="8.5" r="5.5"></circle>
+                    <path d="M12.5 12.5 17 17"></path>
+                  </svg>
+                </button>
+                <button class="icon compact" id="refreshSessions" title="刷新 sessions" aria-label="刷新 sessions">
+                  <svg class="button-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="M16 7.5A6.5 6.5 0 1 0 17 12"></path>
+                    <path d="M16 3.5v4h-4"></path>
+                  </svg>
+                </button>
+              </div>
+            </div>
             <div class="meta" id="sessionCount">-</div>
+            <div class="session-search-row" id="sessionSearchRow" hidden>
+              <input id="sessionSearch" placeholder="id / cwd / path / preview / model" autocomplete="off">
+            </div>
           </div>
         </div>
         <div class="session-actions">
@@ -1791,15 +2248,28 @@ function html(state) {
         </div>
         <div class="tools">
           <div class="tool-row record-toolbar">
-            <button class="compact" id="openFilterButton" disabled>筛选/查找</button>
+            <button class="compact" id="openFilterButton" disabled>筛选对话</button>
             <button class="compact" id="clearRecordFilterButton" disabled>清除筛选</button>
-            <span class="toolbar-divider" aria-hidden="true"></span>
-            <button class="compact" id="openReplaceButton" disabled>查找替换</button>
-            <input id="dropLines" type="text" placeholder="3,5-8" aria-label="删除行范围">
-            <button class="danger compact" id="dropLinesButton" disabled>删除行</button>
+            <span class="help-icon" tabindex="0" title="筛选条件只改变 Turn 主视图；Lines 明细会跟随这个范围，底部 Lines 查找不会反向筛选 Turn。">i</span>
           </div>
         </div>
-        <div class="record-list" id="recordList"></div>
+        <div class="turn-list" id="turnList"></div>
+        <div class="record-detail" id="recordDetail">
+          <button class="record-detail-head" id="toggleLineDetailsButton" type="button" aria-expanded="false">
+            <span>
+              <span class="record-detail-title">JSONL lines 明细</span>
+              <span class="record-detail-meta" id="lineDetailMeta">完整记录表默认收起</span>
+            </span>
+            <span class="history-caret" aria-hidden="true"></span>
+          </button>
+          <div class="line-tools">
+            <button class="compact" id="openReplaceButton" disabled>查找 / 替换 lines</button>
+            <button class="compact" id="clearLineFilterButton" disabled>清除查找</button>
+            <input id="dropLines" type="text" placeholder="3,5-8" aria-label="删除 JSONL 行范围">
+            <button class="danger compact" id="dropLinesButton" disabled>删除 lines</button>
+          </div>
+          <div class="record-list" id="recordList"></div>
+        </div>
         <div class="history-drawer" id="historyDrawer">
           <button class="history-summary" id="toggleHistoryButton" type="button" aria-expanded="false">
             <span class="history-title">操作历史</span>
@@ -1871,11 +2341,19 @@ function html(state) {
       sessions: [],
       selectedSession: null,
       selectedSessionIds: new Set(),
+      sessionSearchOpen: false,
       records: [],
       filteredRecords: [],
+      turnFilteredRecords: [],
+      lineScopeRecords: [],
+      turns: [],
+      selectedTurnId: null,
+      focusedLine: null,
+      lineDetailsOpen: false,
       operationHistory: [],
       historyOpen: false,
-      recordFilter: { query: '', roles: [], types: [] },
+      turnFilter: blankRecordFilter(),
+      lineFilter: blankRecordFilter(),
       selectedRecord: null,
       wrapJson: true,
       dirty: false,
@@ -1893,6 +2371,8 @@ function html(state) {
       editorPane: document.querySelector('.editor'),
       pathline: document.getElementById('pathline'),
       sessionSearch: document.getElementById('sessionSearch'),
+      sessionSearchRow: document.getElementById('sessionSearchRow'),
+      toggleSessionSearchButton: document.getElementById('toggleSessionSearchButton'),
       refreshSessions: document.getElementById('refreshSessions'),
       resetLayoutButton: document.getElementById('resetLayoutButton'),
       allowActive: document.getElementById('allowActive'),
@@ -1916,8 +2396,13 @@ function html(state) {
       openFilterButton: document.getElementById('openFilterButton'),
       clearRecordFilterButton: document.getElementById('clearRecordFilterButton'),
       openReplaceButton: document.getElementById('openReplaceButton'),
+      clearLineFilterButton: document.getElementById('clearLineFilterButton'),
       dropLines: document.getElementById('dropLines'),
       dropLinesButton: document.getElementById('dropLinesButton'),
+      turnList: document.getElementById('turnList'),
+      recordDetail: document.getElementById('recordDetail'),
+      toggleLineDetailsButton: document.getElementById('toggleLineDetailsButton'),
+      lineDetailMeta: document.getElementById('lineDetailMeta'),
       recordList: document.getElementById('recordList'),
       historyDrawer: document.getElementById('historyDrawer'),
       toggleHistoryButton: document.getElementById('toggleHistoryButton'),
@@ -1989,6 +2474,16 @@ function html(state) {
       }
     }
 
+    function setSessionSearchOpen(open) {
+      state.sessionSearchOpen = Boolean(open);
+      els.sessionSearchRow.hidden = !state.sessionSearchOpen;
+      els.toggleSessionSearchButton.setAttribute('aria-expanded', state.sessionSearchOpen ? 'true' : 'false');
+      els.toggleSessionSearchButton.classList.toggle('active', state.sessionSearchOpen || Boolean(els.sessionSearch.value.trim()));
+      if (state.sessionSearchOpen) {
+        setTimeout(() => els.sessionSearch.focus(), 0);
+      }
+    }
+
     function renderSessions() {
       if (state.sessions.length === 0) {
         els.sessionList.innerHTML = '<div class="empty">No sessions</div>';
@@ -2025,6 +2520,8 @@ function html(state) {
       }
       state.selectedSession = session;
       state.selectedRecord = null;
+      state.selectedTurnId = null;
+      state.focusedLine = null;
       state.historyOpen = false;
       state.dirty = false;
       renderSessions();
@@ -2040,7 +2537,12 @@ function html(state) {
       state.selectedSession = data.session;
       state.records = data.records;
       state.filteredRecords = data.records;
+      state.turnFilteredRecords = data.records;
+      state.lineScopeRecords = data.records;
+      state.turns = data.turns || [];
       state.selectedRecord = null;
+      state.selectedTurnId = firstConversationTurnId();
+      state.focusedLine = null;
       state.dirty = false;
       els.reloadRecords.disabled = false;
       els.dropLinesButton.disabled = false;
@@ -2055,32 +2557,74 @@ function html(state) {
     }
 
     function filterRecords() {
-      const needle = state.recordFilter.query.trim().toLowerCase();
-      const roles = Array.isArray(state.recordFilter.roles) ? state.recordFilter.roles : [];
-      const types = Array.isArray(state.recordFilter.types) ? state.recordFilter.types : [];
-      state.filteredRecords = state.records.filter((record) => {
-        if (roles.length > 0 && !roles.includes(record.role || '')) {
-          return false;
-        }
-        if (types.length > 0 && !types.includes(record.type || '')) {
-          return false;
-        }
-        if (!needle) {
-          return true;
-        }
-        return [record.line, record.type, record.payloadType, record.role, record.text, record.timestamp, record.json]
-          .join(' ')
-          .toLowerCase()
-          .includes(needle);
-      });
-      els.clearRecordFilterButton.disabled = !hasRecordFilter();
-      els.openFilterButton.textContent = hasRecordFilter() ? '筛选中' : '筛选/查找';
-      if (state.selectedSession) {
-        const filtered = state.filteredRecords.length;
-        const total = state.records.length;
-        updateRecordHeader(filtered === total ? total : filtered + ' / ' + total);
+      const turnResult = recordsMatchingFilter(state.records, state.turnFilter);
+      if (turnResult.error) {
+        state.turnFilteredRecords = [];
+        state.lineScopeRecords = [];
+        state.filteredRecords = [];
+        setStatus('Invalid turn regex: ' + turnResult.error.message, 'error');
+        renderTurns();
+        renderRecords();
+        return;
       }
+
+      state.turnFilteredRecords = turnResult.records;
+      state.lineScopeRecords = hasTurnFilter() ? recordsInMatchedTurns(state.turnFilteredRecords) : state.records;
+      const lineResult = recordsMatchingFilter(state.lineScopeRecords, state.lineFilter);
+      if (lineResult.error) {
+        state.filteredRecords = [];
+        setStatus('Invalid line regex: ' + lineResult.error.message, 'error');
+        renderTurns();
+        renderRecords();
+        return;
+      }
+
+      state.filteredRecords = lineResult.records;
+      els.clearRecordFilterButton.disabled = !hasTurnFilter();
+      els.openFilterButton.textContent = hasTurnFilter() ? '筛选中' : '筛选对话';
+      els.clearLineFilterButton.disabled = !hasLineFilter();
+      els.openReplaceButton.textContent = hasLineFilter() ? '查找中' : '查找 / 替换 lines';
+      if (state.selectedSession) {
+        updateRecordHeader(state.records.length);
+      }
+      renderTurns();
       renderRecords();
+    }
+
+    function recordsMatchingFilter(records, filter) {
+      const matcher = buildRecordFilterMatcher(filter);
+      const roles = Array.isArray(filter.roles) ? filter.roles : [];
+      const types = Array.isArray(filter.types) ? filter.types : [];
+      const scope = filter.scope || 'all';
+      if (matcher && matcher.error) {
+        return { records: [], error: matcher.error };
+      }
+      return {
+        records: records.filter((record) => {
+          if (roles.length > 0 && !roles.includes(record.role || '')) {
+            return false;
+          }
+          if (types.length > 0 && !types.includes(record.type || '')) {
+            return false;
+          }
+          if (!recordMatchesFindScope(record, scope)) {
+            return false;
+          }
+          if (!matcher) {
+            return true;
+          }
+          return matcher.test(recordSearchText(record));
+        })
+      };
+    }
+
+    function recordsInMatchedTurns(records) {
+      const conversationTurnIds = new Set(state.turns.filter((turn) => turn.kind !== 'setup').map((turn) => turn.id));
+      const turnIds = new Set(records.map((record) => record.turnId).filter((turnId) => conversationTurnIds.has(turnId)));
+      if (turnIds.size === 0) {
+        return [];
+      }
+      return state.records.filter((record) => record.turnId && turnIds.has(record.turnId));
     }
 
     function updateRecordHeader(recordCount) {
@@ -2131,33 +2675,147 @@ function html(state) {
       els.copyRecordPathButton.setAttribute('aria-label', copyTitle);
     }
 
+    function renderTurns() {
+      if (!state.selectedSession) {
+        els.turnList.innerHTML = '<div class="empty">Select a session</div>';
+        return;
+      }
+
+      const hasFilter = hasTurnFilter();
+      const filteredCounts = new Map();
+      for (const record of state.turnFilteredRecords) {
+        if (!record.turnId) {
+          continue;
+        }
+        filteredCounts.set(record.turnId, (filteredCounts.get(record.turnId) || 0) + 1);
+      }
+
+      const turns = state.turns.filter((turn) => {
+        if (turn.kind === 'setup') {
+          return false;
+        }
+        return !hasFilter || filteredCounts.has(turn.id);
+      });
+
+      if (turns.length === 0) {
+        state.selectedTurnId = null;
+        els.turnList.innerHTML = '<div class="empty">' + (hasFilter ? '没有匹配的对话轮' : 'No conversation turns') + '</div>';
+        return;
+      }
+
+      if (!state.selectedTurnId || !turns.some((turn) => turn.id === state.selectedTurnId)) {
+        state.selectedTurnId = turns[0].id;
+        state.focusedLine = null;
+      }
+
+      els.turnList.innerHTML = turns.map((turn) => turnItemHtml(turn, filteredCounts.get(turn.id) || 0, hasFilter)).join('');
+    }
+
+    function turnItemHtml(turn, matchedLines, hasFilter) {
+      const active = state.selectedTurnId === turn.id ? ' active' : '';
+      const canTruncate = turn.endLine < state.records.length;
+      const source = turn.sourceTurnId ? ' · ' + shortenText(turn.sourceTurnId, 10) : '';
+      const lineMeta = 'lines ' + turn.startLine + '-' + turn.endLine + ' · ' + turn.lineCount + ' records' +
+        (hasFilter ? ' · match ' + matchedLines : '');
+      const user = turn.userText || '无用户文本摘要';
+      const assistant = turn.assistantText || '无助手文本摘要';
+      return '<div class="turn-item' + active + '" data-select-turn="' + escapeAttr(turn.id) + '" role="button" tabindex="0">' +
+        '<div class="turn-item-main">' +
+        '<div class="turn-item-head">' +
+        '<span class="turn-item-title">' + escapeHtml(turn.label + source) + '</span>' +
+        '<span class="turn-line-meta">' + escapeHtml(lineMeta) + '</span>' +
+        '</div>' +
+        '<div class="turn-messages">' +
+        '<div class="turn-message"><b>用户</b><span title="' + escapeAttr(user) + '">' + escapeHtml(user) + '</span></div>' +
+        '<div class="turn-message"><b>助手</b><span title="' + escapeAttr(assistant) + '">' + escapeHtml(assistant) + '</span></div>' +
+        '</div>' +
+        '</div>' +
+        '<div class="turn-item-actions">' +
+        '<button class="icon compact" data-edit-turn="' + escapeAttr(turn.id) + '" title="修改这轮对话" aria-label="修改这轮对话"' + (turn.editableTargetCount ? '' : ' disabled') + '><span class="turn-action-mark" aria-hidden="true">✎</span></button>' +
+        '<button class="icon danger compact" data-truncate-turn="' + escapeAttr(turn.id) + '" title="回退到此处" aria-label="回退到此处"' + (canTruncate ? '' : ' disabled') + '><span class="turn-action-mark" aria-hidden="true">↩</span></button>' +
+        '</div>' +
+        '</div>';
+    }
+
+    function lineDetailRecords() {
+      const records = state.filteredRecords.slice();
+      if (!state.selectedTurnId) {
+        return records;
+      }
+      const turn = state.turns.find((item) => item.id === state.selectedTurnId);
+      if (!turn) {
+        return records;
+      }
+      if (state.focusedLine !== turn.startLine) {
+        return records;
+      }
+      const startRecord = state.records.find((record) => record.line === turn.startLine);
+      if (startRecord && !records.some((record) => record.line === startRecord.line)) {
+        records.push(startRecord);
+        records.sort((a, b) => a.line - b.line);
+      }
+      return records;
+    }
+
     function renderRecords() {
+      els.recordDetail.classList.toggle('open', state.lineDetailsOpen);
+      els.toggleLineDetailsButton.setAttribute('aria-expanded', state.lineDetailsOpen ? 'true' : 'false');
+      const filtered = state.filteredRecords.length;
+      const total = state.records.length;
+      const turnScopedTotal = hasTurnFilter() ? state.lineScopeRecords.length : total;
+      const detailHint = state.lineDetailsOpen ? '已展开完整 JSONL 行' : '展开查看完整 JSONL 行';
+      const countText = hasLineFilter()
+        ? filtered + ' / ' + turnScopedTotal + ' lines'
+        : (hasTurnFilter() ? turnScopedTotal + ' / ' + total + ' lines' : total + ' lines');
+      const filterHint = [
+        hasTurnFilter() ? 'Turn 筛选范围' : '',
+        hasLineFilter() ? 'Lines 查找' : ''
+      ].filter(Boolean).join(' + ');
+      els.lineDetailMeta.textContent = state.selectedSession
+        ? countText + ' · ' + (filterHint ? filterHint + ' · ' : '') + detailHint
+        : '完整记录表默认收起';
+
       if (!state.selectedSession) {
         els.recordList.innerHTML = '<div class="empty">Select a session</div>';
         return;
       }
-      if (state.filteredRecords.length === 0) {
+      if (!state.lineDetailsOpen) {
+        els.recordList.innerHTML = '';
+        return;
+      }
+      const detailRecords = lineDetailRecords();
+      if (detailRecords.length === 0) {
         els.recordList.innerHTML = '<div class="empty">No records</div>';
         return;
       }
 
-      const rows = state.filteredRecords.map((record) => {
-        const selected = state.selectedRecord && state.selectedRecord.line === record.line ? ' class="selected"' : '';
+      const rows = [];
+      for (const record of detailRecords) {
+        const classes = ['record-row', 'turn-shade-' + (record.turnIndex % 2 === 0 ? '0' : '1')];
+        if (record.messageSide) {
+          classes.push('side-' + record.messageSide);
+        }
+        if (state.selectedRecord && state.selectedRecord.line === record.line) {
+          classes.push('selected');
+        }
+        if (state.focusedLine === record.line) {
+          classes.push('focused-line');
+        }
         const kind = record.payloadType ? record.type + ':' + record.payloadType : record.type;
-        return '<tr data-line="' + record.line + '"' + selected + '>' +
+        rows.push('<tr class="' + classes.join(' ') + '" data-line="' + record.line + '">' +
           '<td class="line-col">' + record.line + '</td>' +
           '<td class="type-col clip"><span class="record-kind">' + escapeHtml(kind) + '</span></td>' +
           '<td class="role-col clip"><span class="role-badge">' + escapeHtml(record.role || '-') + '</span></td>' +
           '<td class="clip">' + escapeHtml(record.text || '') + '</td>' +
-          '</tr>';
-      }).join('');
+          '</tr>');
+      }
       els.recordList.innerHTML =
         '<table><thead><tr>' +
         recordHeader('line-col', 'Line', 'line') +
         recordHeader('type-col', 'Type', 'type') +
         recordHeader('role-col', 'Role', 'role') +
         '<th class="text-col">Text</th>' +
-        '</tr></thead><tbody>' + rows + '</tbody></table>';
+        '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
       setupColumnResizers();
     }
 
@@ -2242,7 +2900,10 @@ function html(state) {
         return;
       }
       state.selectedRecord = record;
+      state.selectedTurnId = record.turnId || state.selectedTurnId;
+      state.focusedLine = null;
       state.dirty = false;
+      renderTurns();
       renderRecords();
       prepareEditorForRecord(record);
       if (record.json) {
@@ -2304,6 +2965,14 @@ function html(state) {
       const filteredIndex = state.filteredRecords.findIndex((item) => item.line === line);
       if (filteredIndex !== -1) {
         state.filteredRecords[filteredIndex] = nextRecord;
+      }
+      const turnFilteredIndex = state.turnFilteredRecords.findIndex((item) => item.line === line);
+      if (turnFilteredIndex !== -1) {
+        state.turnFilteredRecords[turnFilteredIndex] = nextRecord;
+      }
+      const lineScopeIndex = state.lineScopeRecords.findIndex((item) => item.line === line);
+      if (lineScopeIndex !== -1) {
+        state.lineScopeRecords[lineScopeIndex] = nextRecord;
       }
       if (!state.selectedRecord || state.selectedRecord.line !== line) {
         return false;
@@ -2410,6 +3079,7 @@ function html(state) {
         return;
       }
       setStatus('Replacing...');
+      const scopedLines = hasTurnFilter() ? state.lineScopeRecords.map((record) => record.line) : null;
       const result = await api(sessionApiPath(state.selectedSession, '/replace'), {
         method: 'POST',
         body: JSON.stringify({
@@ -2417,11 +3087,109 @@ function html(state) {
           to: options.to,
           scope: options.scope,
           regex: options.regex,
+          caseSensitive: options.caseSensitive,
+          lines: scopedLines,
           allowActive: els.allowActive.checked
         })
       });
-      setStatus('Replaced ' + result.replacements + ' occurrence(s). Backup: ' + (result.backup ? result.backup.backupPath : '-'), 'ok', true);
+      const suffix = scopedLines ? ' in current Turn filter' : '';
+      setStatus('Replaced ' + result.replacements + ' occurrence(s)' + suffix + '. Backup: ' + (result.backup ? result.backup.backupPath : '-'), 'ok', true);
       await loadRecords();
+    }
+
+    function findLines(options) {
+      if (!state.selectedSession || !options || !options.from) {
+        return;
+      }
+      state.lineFilter = {
+        query: options.from,
+        roles: [],
+        types: [],
+        scope: options.scope || 'all',
+        regex: Boolean(options.regex),
+        caseSensitive: Boolean(options.caseSensitive)
+      };
+      state.lineDetailsOpen = true;
+      filterRecords();
+      const found = state.filteredRecords.length;
+      const suffix = hasTurnFilter() ? ' in current Turn filter.' : '.';
+      setStatus('Found ' + found + ' JSONL line(s)' + suffix, found > 0 ? 'ok' : '', true);
+    }
+
+    async function openTurnEditModal(turnId) {
+      if (!state.selectedSession) {
+        return;
+      }
+      const data = await api(sessionApiPath(state.selectedSession, '/turns/' + encodeURIComponent(turnId) + '/edit'));
+      const groups = data.groups || [];
+      if (groups.length === 0) {
+        showToast('这一轮没有可快速修改的用户/助手消息', 'error');
+        return;
+      }
+      const result = await openModal({
+        kicker: 'Edit conversation',
+        title: (data.turn ? data.turn.label : 'Turn') + ' · 快速修改',
+        body: turnEditModalBody(data),
+        size: 'wide',
+        confirmText: '保存修改',
+        cancelText: '取消',
+        collect: () => ({
+          edits: Array.from(document.querySelectorAll('[data-turn-edit-group]')).map((textarea) => ({
+            id: textarea.dataset.turnEditGroup,
+            text: textarea.value
+          }))
+        }),
+      });
+      if (!result) {
+        return;
+      }
+      await saveTurnMessages(turnId, result.edits);
+    }
+
+    async function saveTurnMessages(turnId, edits) {
+      if (!state.selectedSession) {
+        return;
+      }
+      setStatus('Saving conversation turn...');
+      const result = await api(sessionApiPath(state.selectedSession, '/turns/' + encodeURIComponent(turnId) + '/edit'), {
+        method: 'PUT',
+        body: JSON.stringify({
+          edits,
+          allowActive: els.allowActive.checked
+        })
+      });
+      state.dirty = false;
+      setStatus(
+        'Updated ' + result.changedGroups + ' message group(s), ' + result.changedTargets + ' target(s). Backup: ' +
+          (result.backup ? result.backup.backupPath : '-'),
+        'ok',
+        true
+      );
+      await loadRecords();
+    }
+
+    async function truncateAfterTurn(turnId) {
+      if (!state.selectedSession) {
+        return;
+      }
+      const turn = state.turns.find((item) => item.id === turnId);
+      if (!turn) {
+        return;
+      }
+      if (!(await confirmTruncateTurn(turn))) {
+        return;
+      }
+      setStatus('Rolling back conversation...');
+      const result = await api(sessionApiPath(state.selectedSession, '/turns/' + encodeURIComponent(turnId) + '/truncate'), {
+        method: 'POST',
+        body: JSON.stringify({
+          allowActive: els.allowActive.checked
+        })
+      });
+      state.dirty = false;
+      setStatus('Deleted ' + result.removedLines.length + ' later line(s). Backup: ' + (result.backup ? result.backup.backupPath : '-'), 'ok', true);
+      await loadRecords();
+      await loadSessions();
     }
 
     async function openFilterModal() {
@@ -2429,21 +3197,32 @@ function html(state) {
         return;
       }
       const result = await openModal({
-        kicker: 'Filter records',
-        title: '筛选 / 查找 records',
+        kicker: 'Filter conversations',
+        title: '筛选对话',
         body: filterModalBody(),
         confirmText: '应用筛选',
         cancelText: '取消',
-        collect: () => ({
-          query: document.getElementById('modalFilterQuery').value.trim(),
-          roles: checkedValues('[data-filter-role]'),
-          types: checkedValues('[data-filter-type]'),
-        }),
+        collect: () => {
+          const query = document.getElementById('modalFilterQuery').value.trim();
+          const regex = document.getElementById('modalFilterRegex').checked;
+          const error = document.getElementById('modalFilterError');
+          if (query && !validateFindPattern(query, regex, error)) {
+            return false;
+          }
+          return {
+            query,
+            roles: checkedValues('[data-filter-role]'),
+            types: checkedValues('[data-filter-type]'),
+            scope: document.getElementById('modalFilterScope').value,
+            regex,
+            caseSensitive: document.getElementById('modalFilterCaseSensitive').checked,
+          };
+        },
       });
       if (!result) {
         return;
       }
-      state.recordFilter = result;
+      state.turnFilter = result;
       filterRecords();
     }
 
@@ -2452,43 +3231,198 @@ function html(state) {
         return;
       }
       const result = await openModal({
-        kicker: 'Find and replace',
-        title: '查找替换',
+        kicker: 'Find and replace lines',
+        title: '查找 / 替换 JSONL lines',
         body: replaceModalBody(),
-        confirmText: '执行替换',
+        confirmText: '查找',
         cancelText: '取消',
-        variant: 'danger',
+        afterOpen: setupFindReplaceModal,
         collect: () => {
           const from = document.getElementById('modalReplaceFrom').value;
+          const regex = document.getElementById('modalReplaceRegex').checked;
           const error = document.getElementById('modalReplaceError');
-          if (!from) {
-            error.classList.add('show');
-            document.getElementById('modalReplaceFrom').focus();
+          if (!validateFindPattern(from, regex, error)) {
             return false;
           }
           return {
             from,
             to: document.getElementById('modalReplaceTo').value,
             scope: document.getElementById('modalReplaceScope').value,
-            regex: document.getElementById('modalReplaceRegex').checked,
+            regex,
+            caseSensitive: document.getElementById('modalReplaceCaseSensitive').checked,
+            replaceEnabled: document.getElementById('modalReplaceEnabled').checked,
           };
         },
       });
       if (result) {
-        await replaceText(result);
+        if (result.replaceEnabled) {
+          await replaceText(result);
+        } else {
+          findLines(result);
+        }
       }
     }
 
     function clearRecordFilter() {
-      state.recordFilter = { query: '', roles: [], types: [] };
+      state.turnFilter = blankRecordFilter();
       filterRecords();
     }
 
-    function hasRecordFilter() {
+    function clearLineFilter() {
+      state.lineFilter = blankRecordFilter();
+      filterRecords();
+    }
+
+    function firstConversationTurnId() {
+      const turn = state.turns.find((item) => item.kind !== 'setup');
+      return turn ? turn.id : null;
+    }
+
+    function selectTurn(turnId, options = {}) {
+      const turn = state.turns.find((item) => item.id === turnId);
+      if (!turn) {
+        return;
+      }
+      state.selectedTurnId = turn.id;
+      if (options.scrollLines) {
+        state.lineDetailsOpen = true;
+        state.focusedLine = turn.startLine;
+      }
+      renderTurns();
+      renderRecords();
+      if (options.scrollLines) {
+        scrollRecordLineIntoView(turn.startLine);
+      }
+    }
+
+    function scrollRecordLineIntoView(line) {
+      window.requestAnimationFrame(() => {
+        const row = els.recordList.querySelector('[data-line="' + line + '"]');
+        if (row) {
+          row.scrollIntoView({ block: 'center' });
+        }
+      });
+    }
+
+    function recordSearchText(record) {
+      return [
+        record.line,
+        record.turnLabel,
+        record.turnId,
+        record.messageSide,
+        record.type,
+        record.payloadType,
+        record.role,
+        record.text,
+        record.timestamp,
+        record.json
+      ].join(' ');
+    }
+
+    function buildRecordFilterMatcher(filter) {
+      const query = String(filter.query || '').trim();
+      if (!query) {
+        return null;
+      }
+      if (filter.regex) {
+        try {
+          const regex = new RegExp(query, filter.caseSensitive ? '' : 'i');
+          return {
+            test(value) {
+              regex.lastIndex = 0;
+              return regex.test(value);
+            }
+          };
+        } catch (error) {
+          return { error };
+        }
+      }
+      const needle = filter.caseSensitive ? query : query.toLowerCase();
+      return {
+        test(value) {
+          const haystack = filter.caseSensitive ? String(value || '') : String(value || '').toLowerCase();
+          return haystack.includes(needle);
+        }
+      };
+    }
+
+    function recordMatchesFindScope(record, scope) {
+      if (!scope || scope === 'all') {
+        return true;
+      }
+      const role = String(record.role || '').toLowerCase();
+      const type = String(record.payloadType || record.type || '').toLowerCase();
+      const recordType = String(record.type || '').toLowerCase();
+      if (scope === 'messages') {
+        return Boolean(role) || recordType === 'response_item' || recordType === 'event_msg';
+      }
+      if (scope === 'metadata') {
+        return recordType === 'session_meta' || recordType === 'turn_context';
+      }
+      if (['user', 'assistant', 'system', 'tool'].includes(scope)) {
+        return role === scope || type.includes(scope);
+      }
+      return true;
+    }
+
+    function validateFindPattern(pattern, regex, error) {
+      if (error) {
+        error.classList.remove('show');
+      }
+      if (!pattern) {
+        if (error) {
+          error.textContent = '请输入要查找的文本。';
+          error.classList.add('show');
+        }
+        return false;
+      }
+      if (regex) {
+        try {
+          new RegExp(pattern);
+        } catch (regexError) {
+          if (error) {
+            error.textContent = '正则无效: ' + regexError.message;
+            error.classList.add('show');
+          }
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function setupFindReplaceModal() {
+      const enabled = document.getElementById('modalReplaceEnabled');
+      const replaceInput = document.getElementById('modalReplaceTo');
+      if (!enabled || !replaceInput) {
+        return;
+      }
+      const update = () => {
+        replaceInput.disabled = !enabled.checked;
+        els.modalConfirmButton.textContent = enabled.checked ? '执行替换' : '查找';
+        els.modalConfirmButton.className = (enabled.checked ? 'danger' : 'primary') + ' compact';
+      };
+      enabled.addEventListener('change', update);
+      update();
+    }
+
+    function blankRecordFilter() {
+      return { query: '', roles: [], types: [], scope: 'all', regex: false, caseSensitive: false };
+    }
+
+    function hasTurnFilter() {
+      return hasRecordFilter(state.turnFilter);
+    }
+
+    function hasLineFilter() {
+      return hasRecordFilter(state.lineFilter);
+    }
+
+    function hasRecordFilter(filter) {
       return Boolean(
-        state.recordFilter.query ||
-        (Array.isArray(state.recordFilter.roles) && state.recordFilter.roles.length > 0) ||
-        (Array.isArray(state.recordFilter.types) && state.recordFilter.types.length > 0)
+        filter.query ||
+        (filter.scope && filter.scope !== 'all') ||
+        (Array.isArray(filter.roles) && filter.roles.length > 0) ||
+        (Array.isArray(filter.types) && filter.types.length > 0)
       );
     }
 
@@ -2516,9 +3450,17 @@ function html(state) {
       state.selectedSessionIds.clear();
       state.records = [];
       state.filteredRecords = [];
+      state.turnFilteredRecords = [];
+      state.lineScopeRecords = [];
+      state.turns = [];
+      state.selectedTurnId = null;
+      state.focusedLine = null;
       state.operationHistory = [];
       state.selectedRecord = null;
+      state.turnFilter = blankRecordFilter();
+      state.lineFilter = blankRecordFilter();
       state.dirty = false;
+      state.lineDetailsOpen = false;
       renderOperationHistory();
       clearEditor();
       els.reloadRecords.disabled = true;
@@ -2526,12 +3468,17 @@ function html(state) {
       els.openFilterButton.disabled = true;
       els.openReplaceButton.disabled = true;
       els.clearRecordFilterButton.disabled = true;
+      els.clearLineFilterButton.disabled = true;
       els.recordTitle.textContent = 'Records';
       els.recordMeta.textContent = 'Select a session';
       els.recordPath.textContent = '';
       els.recordPathRow.hidden = true;
       els.copyRecordPathButton.disabled = true;
       delete els.copyRecordPathButton.dataset.copyPath;
+      els.turnList.innerHTML = '<div class="empty">Select a session</div>';
+      els.recordDetail.classList.remove('open');
+      els.toggleLineDetailsButton.setAttribute('aria-expanded', 'false');
+      els.lineDetailMeta.textContent = '完整记录表默认收起';
       els.recordList.innerHTML = '<div class="empty">Select a session</div>';
       setStatus('Moved ' + result.count + ' session(s) to trash: ' + result.batchId, 'ok', true);
       await loadSessions();
@@ -2670,8 +3617,12 @@ function html(state) {
       els.modalConfirmButton.textContent = options.confirmText || '确认';
       els.modalConfirmButton.className = (options.variant === 'danger' ? 'danger' : 'primary') + ' compact';
       state.modalCollect = options.collect || null;
+      els.modalLayer.classList.toggle('wide', options.size === 'wide');
       els.modalLayer.classList.add('open');
       els.modalLayer.setAttribute('aria-hidden', 'false');
+      if (typeof options.afterOpen === 'function') {
+        options.afterOpen();
+      }
       setTimeout(() => els.modalConfirmButton.focus(), 0);
 
       return new Promise((resolve) => {
@@ -2687,6 +3638,7 @@ function html(state) {
       state.modalResolver = null;
       state.modalCollect = null;
       els.modalLayer.classList.remove('open');
+      els.modalLayer.classList.remove('wide');
       els.modalLayer.setAttribute('aria-hidden', 'true');
       els.modalBody.innerHTML = '';
       resolve(result);
@@ -2737,6 +3689,24 @@ function html(state) {
         body: '<p>将从当前 session 中删除以下行范围，并在写入前自动创建备份。</p>' +
           '<div class="modal-note">' + escapeHtml(lines) + '</div>',
         confirmText: '删除行',
+        variant: 'danger'
+      });
+    }
+
+    function confirmTruncateTurn(turn) {
+      const removeCount = Math.max(0, state.records.length - turn.endLine);
+      if (removeCount === 0) {
+        showToast('这一轮后面没有可删除的记录', 'error');
+        return false;
+      }
+      return openModal({
+        kicker: 'Rollback conversation',
+        title: '回退到 ' + turn.label + '？',
+        body: '<p>这会删除当前 session 中该轮之后的所有 JSONL 行，并在写入前自动创建备份。</p>' +
+          '<div class="modal-note">保留 lines 1-' + escapeHtml(String(turn.endLine)) +
+          '，删除 lines ' + escapeHtml(String(turn.endLine + 1)) + '-' + escapeHtml(String(state.records.length)) +
+          '（共 ' + escapeHtml(String(removeCount)) + ' 行）。</div>',
+        confirmText: '删除后续记录',
         variant: 'danger'
       });
     }
@@ -2813,13 +3783,61 @@ function html(state) {
         '<div class="modal-list">' + (rows || '<div class="empty">No manifest sessions</div>') + '</div>';
     }
 
+    function turnEditModalBody(data) {
+      const turn = data.turn || {};
+      const groups = data.groups || [];
+      return '<p>' + escapeHtml([
+        'lines ' + turn.startLine + '-' + turn.endLine,
+        (turn.userTargetCount || 0) + ' user target(s)',
+        (turn.assistantTargetCount || 0) + ' assistant target(s)'
+      ].join(' · ')) + ' ' +
+        helpIcon('相同文本的重复表示会合并在一个输入框里，保存时同步写回对应的 event_msg / response_item / task_complete 记录。') +
+        '</p>' +
+        turnEditSection('用户输入', groups.filter((group) => group.side === 'user')) +
+        turnEditSection('助手输出', groups.filter((group) => group.side === 'assistant'));
+    }
+
+    function turnEditSection(title, groups) {
+      const rows = groups.map((group, index) => {
+        const lineLabel = 'lines ' + group.lines.join(', ') + ' · ' + group.targetCount + ' target(s)';
+        return '<div class="modal-field">' +
+          '<label>' + escapeHtml(title + ' ' + (index + 1)) +
+          ' <span class="turn-edit-target">' + escapeHtml(lineLabel) + '</span></label>' +
+          '<textarea data-turn-edit-group="' + escapeAttr(group.id) + '">' + escapeHtml(group.text || '') + '</textarea>' +
+          '</div>';
+      }).join('');
+      return '<div class="turn-edit-section">' +
+        '<div class="turn-edit-section-title">' + escapeHtml(title) + '</div>' +
+        (rows || '<div class="empty">没有可修改的' + escapeHtml(title) + '</div>') +
+        '</div>';
+    }
+
     function filterModalBody() {
-      const roles = Array.isArray(state.recordFilter.roles) ? state.recordFilter.roles : [];
-      const types = Array.isArray(state.recordFilter.types) ? state.recordFilter.types : [];
+      const roles = Array.isArray(state.turnFilter.roles) ? state.turnFilter.roles : [];
+      const types = Array.isArray(state.turnFilter.types) ? state.turnFilter.types : [];
       return '<div class="modal-grid">' +
         '<div class="modal-field">' +
-        '<label for="modalFilterQuery">查找文本</label>' +
-        '<input id="modalFilterQuery" value="' + escapeAttr(state.recordFilter.query) + '" placeholder="搜索完整 JSON / 预览 / 类型 / 时间">' +
+        '<label for="modalFilterQuery">查找文本 ' +
+        helpIcon('筛选条件作用在 Turn 主视图上；Lines 明细会跟随这个上层范围，但 Lines 查找不会反向改变 Turn 列表。') +
+        '</label>' +
+        '<input id="modalFilterQuery" value="' + escapeAttr(state.turnFilter.query) + '" placeholder="搜索 JSONL line / 预览 / 类型 / 时间">' +
+        '<div class="modal-error" id="modalFilterError">请输入有效的查找文本。</div>' +
+        '</div>' +
+        '<div class="modal-inline">' +
+        checkboxHtml('case', '区分大小写', 'id="modalFilterCaseSensitive" data-filter-option', state.turnFilter.caseSensitive ? ['case'] : []) +
+        checkboxHtml('regex', '正则', 'id="modalFilterRegex" data-filter-option', state.turnFilter.regex ? ['regex'] : []) +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="modalFilterScope">查找范围</label>' +
+        '<select id="modalFilterScope">' +
+        optionHtml('all', 'all JSONL lines', state.turnFilter.scope || 'all') +
+        optionHtml('messages', 'messages', state.turnFilter.scope || 'all') +
+        optionHtml('user', 'user', state.turnFilter.scope || 'all') +
+        optionHtml('assistant', 'assistant', state.turnFilter.scope || 'all') +
+        optionHtml('system', 'system', state.turnFilter.scope || 'all') +
+        optionHtml('tool', 'tool', state.turnFilter.scope || 'all') +
+        optionHtml('metadata', 'metadata', state.turnFilter.scope || 'all') +
+        '</select>' +
         '</div>' +
         '<div class="modal-field">' +
         '<label>Role 多选</label>' +
@@ -2837,40 +3855,50 @@ function html(state) {
         recordTypeChoices() +
         '</div>' +
         '</div>' +
-        '<div class="modal-note">Role 或 type 不选表示全部；多选会取并集后再和查找文本组合过滤。</div>' +
         '</div>';
     }
 
     function replaceModalBody() {
+      const lineFilter = state.lineFilter || blankRecordFilter();
+      const selectedScope = hasLineFilter() ? (lineFilter.scope || 'messages') : 'messages';
       return '<div class="modal-grid">' +
         '<div class="modal-field">' +
-        '<label for="modalReplaceScope">替换范围</label>' +
+        '<label for="modalReplaceFrom">查找 ' +
+        helpIcon('默认只查找并筛选底部 Lines，不写文件，也不会改变 Turn 列表；如上方有 Turn 筛选，查找和替换都只在该范围内执行。') +
+        '</label>' +
+        '<input id="modalReplaceFrom" value="' + escapeAttr(lineFilter.query) + '" placeholder="Find">' +
+        '<div class="modal-error" id="modalReplaceError">请输入要查找的文本。</div>' +
+        '</div>' +
+        '<div class="modal-inline">' +
+        checkboxHtml('case', '区分大小写', 'id="modalReplaceCaseSensitive" data-find-replace-option', lineFilter.caseSensitive ? ['case'] : []) +
+        checkboxHtml('regex', '正则', 'id="modalReplaceRegex" data-find-replace-option', lineFilter.regex ? ['regex'] : []) +
+        '<label class="switch"><input type="checkbox" id="modalReplaceEnabled"><span>启用替换</span></label>' +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="modalReplaceScope">查找范围</label>' +
         '<select id="modalReplaceScope">' +
-        optionHtml('messages', 'messages', 'messages') +
-        optionHtml('user', 'user', 'messages') +
-        optionHtml('assistant', 'assistant', 'messages') +
-        optionHtml('system', 'system', 'messages') +
-        optionHtml('tool', 'tool', 'messages') +
-        optionHtml('metadata', 'metadata', 'messages') +
-        optionHtml('all', 'all', 'messages') +
+        optionHtml('messages', 'messages', selectedScope) +
+        optionHtml('user', 'user', selectedScope) +
+        optionHtml('assistant', 'assistant', selectedScope) +
+        optionHtml('system', 'system', selectedScope) +
+        optionHtml('tool', 'tool', selectedScope) +
+        optionHtml('metadata', 'metadata', selectedScope) +
+        optionHtml('all', 'all JSONL lines', selectedScope) +
         '</select>' +
         '</div>' +
         '<div class="modal-field">' +
-        '<label for="modalReplaceFrom">查找</label>' +
-        '<input id="modalReplaceFrom" placeholder="Find">' +
-        '<div class="modal-error" id="modalReplaceError">请输入要查找的文本。</div>' +
-        '</div>' +
-        '<div class="modal-field">' +
         '<label for="modalReplaceTo">替换为</label>' +
-        '<input id="modalReplaceTo" placeholder="Replace">' +
+        '<input id="modalReplaceTo" placeholder="Replace" disabled>' +
         '</div>' +
-        '<label class="switch"><input type="checkbox" id="modalReplaceRegex"><span>regex</span></label>' +
-        '<div class="modal-note">替换会在写入前自动创建备份。Role 筛选请使用“筛选/查找”。</div>' +
         '</div>';
     }
 
+    function helpIcon(text) {
+      return '<span class="help-icon" tabindex="0" title="' + escapeAttr(text) + '">i</span>';
+    }
+
     function recordTypeChoices() {
-      const types = Array.isArray(state.recordFilter.types) ? state.recordFilter.types : [];
+      const types = Array.isArray(state.turnFilter.types) ? state.turnFilter.types : [];
       return Array.from(new Set(state.records.map((record) => record.type).filter(Boolean)))
         .sort()
         .map((type) => checkboxHtml(type, type, 'data-filter-type', types))
@@ -2949,6 +3977,11 @@ function html(state) {
       if (!value) return '-';
       const home = value.startsWith('/Users/') ? value.replace(/^\\/Users\\/[^/]+/, '~') : value;
       return home.length > 46 ? '...' + home.slice(-43) : home;
+    }
+
+    function shortenText(value, max) {
+      const text = String(value || '');
+      return text.length > max ? text.slice(0, Math.max(0, max - 1)) + '...' : text;
     }
 
     function lastPathSegment(value) {
@@ -3284,10 +4317,19 @@ function html(state) {
 
     els.refreshSessions.addEventListener('click', () => loadSessions().catch(handleError));
     els.resetLayoutButton.addEventListener('click', resetPaneLayout);
-    els.sessionSearch.addEventListener('input', debounce(() => loadSessions().catch(handleError), 180));
+    els.toggleSessionSearchButton.addEventListener('click', () => setSessionSearchOpen(!state.sessionSearchOpen));
+    els.sessionSearch.addEventListener('input', debounce(() => {
+      els.toggleSessionSearchButton.classList.toggle('active', Boolean(els.sessionSearch.value.trim()));
+      loadSessions().catch(handleError);
+    }, 180));
     els.reloadRecords.addEventListener('click', () => loadRecords().catch(handleError));
     els.openFilterButton.addEventListener('click', () => openFilterModal().catch(handleError));
     els.clearRecordFilterButton.addEventListener('click', clearRecordFilter);
+    els.clearLineFilterButton.addEventListener('click', clearLineFilter);
+    els.toggleLineDetailsButton.addEventListener('click', () => {
+      state.lineDetailsOpen = !state.lineDetailsOpen;
+      renderRecords();
+    });
     els.copyRecordPathButton.addEventListener('click', () => {
       copyText(els.copyRecordPathButton.dataset.copyPath || '', '路径已复制').catch(handleError);
     });
@@ -3388,7 +4430,44 @@ function html(state) {
         restoreTrash(button.dataset.restoreTrash).catch(handleError);
       }
     });
+    els.turnList.addEventListener('click', (event) => {
+      const editTurnButton = event.target.closest('[data-edit-turn]');
+      if (editTurnButton) {
+        openTurnEditModal(editTurnButton.dataset.editTurn).catch(handleError);
+        return;
+      }
+      const truncateTurnButton = event.target.closest('[data-truncate-turn]');
+      if (truncateTurnButton) {
+        truncateAfterTurn(truncateTurnButton.dataset.truncateTurn).catch(handleError);
+        return;
+      }
+      const turn = event.target.closest('[data-select-turn]');
+      if (turn) {
+        selectTurn(turn.dataset.selectTurn, { scrollLines: true });
+      }
+    });
+    els.turnList.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') {
+        return;
+      }
+      const turn = event.target.closest('[data-select-turn]');
+      if (!turn) {
+        return;
+      }
+      event.preventDefault();
+      selectTurn(turn.dataset.selectTurn, { scrollLines: true });
+    });
     els.recordList.addEventListener('click', (event) => {
+      const editTurnButton = event.target.closest('[data-edit-turn]');
+      if (editTurnButton) {
+        openTurnEditModal(editTurnButton.dataset.editTurn).catch(handleError);
+        return;
+      }
+      const truncateTurnButton = event.target.closest('[data-truncate-turn]');
+      if (truncateTurnButton) {
+        truncateAfterTurn(truncateTurnButton.dataset.truncateTurn).catch(handleError);
+        return;
+      }
       const row = event.target.closest('[data-line]');
       if (row) {
         selectRecord(Number.parseInt(row.dataset.line, 10)).catch(handleError);
@@ -3403,10 +4482,6 @@ function html(state) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
         event.preventDefault();
         saveCurrentRecord().catch(handleError);
-      }
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'r') {
-        event.preventDefault();
-        loadRecords().catch(handleError);
       }
     });
 

@@ -2,6 +2,8 @@
 
 [English](README.md)
 
+<img src="docs/assets/coldxx-logo.svg" alt="coldxx logo" width="56">
+
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime deps](https://img.shields.io/badge/runtime_deps-0-brightgreen.svg)](package.json)
@@ -14,7 +16,9 @@
 
 - 找到最近的 Codex session，查看它的项目目录、模型、大小、记录数和文件路径。
 - 批量清理历史 session，默认移动到 Trash，后续还能恢复。
-- 打开图形界面，按项目、角色、类型和关键词筛选记录。
+- 打开图形界面，优先按对话轮查看，再按需展开底层 JSONL 明细。
+- 快速修改某一轮对话中的用户输入或助手输出。
+- 快速回退到某一轮对话状态，删除这轮之后的 JSONL 记录。
 - 修改某个 session 里的历史文本，例如把误粘贴的 token 替换成 `[REDACTED]`。
 - 删除 JSONL 中的指定记录行，并自动创建备份。
 - 在改错后，从操作历史或 Trash 中快速回滚。
@@ -95,7 +99,7 @@ coldxx list --json
 
 ```sh
 coldxx show latest
-coldxx show 019dd36c
+coldxx show a1111111
 coldxx show 1 --limit 50
 coldxx show latest --raw
 ```
@@ -105,19 +109,19 @@ coldxx show latest --raw
 先预览，不写文件：
 
 ```sh
-coldxx clean 019dd36c --dry-run
+coldxx clean a1111111 --dry-run
 ```
 
 确认后移动到 Trash：
 
 ```sh
-coldxx clean 019dd36c --yes
+coldxx clean a1111111 --yes
 ```
 
 一次清理多个 session：
 
 ```sh
-coldxx clean 019dd36c 019dd36d 019dd36e --yes
+coldxx clean a1111111 b2222222 c3333333 --yes
 ```
 
 清理所有 session 前强烈建议先 dry-run：
@@ -138,7 +142,7 @@ coldxx trash empty --yes
 永久删除必须显式加 `--permanent --yes`：
 
 ```sh
-coldxx clean 019dd36c --permanent --yes
+coldxx clean a1111111 --permanent --yes
 ```
 
 ### 修改历史记录
@@ -162,6 +166,12 @@ all, messages, user, assistant, system, tool, metadata
 coldxx edit latest --replace "sk-[A-Za-z0-9_-]+" --with "[REDACTED]" --regex --scope messages --yes
 ```
 
+区分大小写替换：
+
+```sh
+coldxx edit latest --replace "API_KEY" --with "[REDACTED]" --case-sensitive --scope messages --yes
+```
+
 删除指定 JSONL 行号：
 
 ```sh
@@ -181,9 +191,14 @@ coldxx ui --host 127.0.0.1 --port 4765
 图形界面适合做这些操作：
 
 - 左侧选择 session，查看项目目录、摘要、大小和记录数。
-- 中间查看记录表格，支持列宽拖拽、搜索、多选过滤和批量删除。
+- 在 Sessions 标题旁展开搜索，不影响当前布局。
+- 中间以对话轮为主视图，点击 Turn 可定位到底层 `task_started` 行。
+- 按文本、角色、记录类型、范围、大小写和正则筛选 Turn。
+- 需要原始记录时再展开 JSONL Lines 明细；Lines 查找不会反向改变 Turn 列表。
+- 在 Lines 里只查找，或启用替换后写入；如果上方有 Turn 筛选，替换会限制在当前 Turn 范围。
+- 从 Turn 卡片快速修改这一轮的用户输入或助手输出。
+- 从 Turn 卡片回退到此处，确认后删除后续 JSONL 记录。
 - 右侧查看当前记录的 JSON，支持格式化、校验、复制和自动换行。
-- 通过弹窗完成查找、筛选和替换，避免挤占主视图。
 - 从 Trash 弹窗查看已删除 batch 里具体有哪些 session，再恢复或清空。
 - 底部操作历史默认收起，需要时展开并回滚到自动备份。
 
@@ -195,7 +210,7 @@ coldxx ui --host 127.0.0.1 --port 4765
 | --- | --- |
 | `latest` | 最新 session |
 | `1`, `2`, `3` | `coldxx list` 的序号，按时间倒序 |
-| `019dd36c` | session id 前缀 |
+| `a1111111` | session id 前缀 |
 | 完整 session id | 精确匹配 |
 | `/path/to/session.jsonl` | 直接指定 JSONL 文件路径 |
 
