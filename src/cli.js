@@ -10,8 +10,10 @@ import {
   dropSessionLines,
   emptyTrash,
   formatBytes,
+  listCodexProfiles,
   listTrash,
   readJsonl,
+  readCodexProfile,
   readSessionSummary,
   replaceInSession,
   resolveCodexHome,
@@ -21,6 +23,7 @@ import {
   scanSessions,
   sessionsRoot,
   oneLine,
+  writeCodexProfile,
 } from "./core.js";
 
 const BOOLEAN_FLAGS = new Set([
@@ -82,6 +85,9 @@ export async function main(argv = process.argv.slice(2), io = process) {
       return dropCommand(parsed.positionals, { ...options, codexHome, managerHome }, io);
     case "trash":
       return trashCommand(parsed.positionals, { ...options, managerHome }, io);
+    case "profiles":
+    case "profile":
+      return profilesCommand(parsed.positionals, { ...options, codexHome, managerHome }, io);
     case "ui":
     case "web":
       return uiCommand(parsed.positionals, { ...options, codexHome, managerHome }, io);
@@ -315,6 +321,52 @@ async function trashCommand(positionals, options, io) {
   throw new Error("Usage: coldxx trash [list|restore|empty]");
 }
 
+async function profilesCommand(positionals, options, io) {
+  const subcommand = positionals[0] || "list";
+
+  if (subcommand === "list" || subcommand === "ls") {
+    const profiles = await listCodexProfiles(options);
+    if (options.json) {
+      io.stdout.write(`${JSON.stringify(profiles, null, 2)}\n`);
+    } else {
+      io.stdout.write(formatProfilesList(profiles));
+    }
+    return 0;
+  }
+
+  if (subcommand === "show") {
+    const name = positionals[1];
+    if (!name) {
+      throw new Error("Usage: coldxx profiles show <name>");
+    }
+    const profile = await readCodexProfile(name, options);
+    if (options.json) {
+      io.stdout.write(`${JSON.stringify(profile, null, 2)}\n`);
+    } else {
+      io.stdout.write(profile.raw);
+    }
+    return 0;
+  }
+
+  if (subcommand === "save") {
+    const name = positionals[1];
+    if (!name || !options.file) {
+      throw new Error("Usage: coldxx profiles save <name> --file <config.toml> --yes");
+    }
+    requireYesUnlessDryRun(options, "save Codex profile config");
+    const raw = await fs.readFile(path.resolve(options.file), "utf8");
+    if (options["dry-run"]) {
+      io.stdout.write(`Would save Codex profile ${name} from ${path.resolve(options.file)}\n`);
+      return 0;
+    }
+    const result = await writeCodexProfile(name, { ...options, raw });
+    io.stdout.write(formatProfileSaveResult(result));
+    return 0;
+  }
+
+  throw new Error("Usage: coldxx profiles [list|show <name>|save <name> --file <config.toml> --yes]");
+}
+
 async function doctorCommand(_positionals, options, io) {
   const root = sessionsRoot(options.codexHome);
   const sessions = await scanSessions({ codexHome: options.codexHome });
@@ -470,6 +522,34 @@ function formatTrashList(items) {
   return `${table(rows, ["id", "cleaned", "count", "dir"])}\n`;
 }
 
+function formatProfilesList(profiles) {
+  if (profiles.length === 0) {
+    return "No Codex profile files found.\n";
+  }
+
+  const rows = profiles.map((profile) => ({
+    name: profile.name,
+    updated: formatDate(profile.updatedAt),
+    size: profile.size,
+    file: profile.file,
+    activate: profile.command,
+  }));
+  return `${table(rows, ["name", "updated", "size", "file", "activate"])}\n`;
+}
+
+function formatProfileSaveResult(result) {
+  const lines = [
+    `Saved Codex profile: ${result.name}`,
+    `file: ${result.file}`,
+    `activate: ${result.command}`,
+    `exec: ${result.execCommand}`,
+  ];
+  if (result.backup) {
+    lines.push(`backup: ${result.backup.backupPath}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 function table(rows, columns) {
   if (rows.length === 0) {
     return "";
@@ -556,7 +636,7 @@ function guardActiveSessions(sessions, options, action) {
   const windowMinutes = numberOption(options["active-window-minutes"], 10);
   const cutoff = Date.now() - windowMinutes * 60 * 1000;
   const active = sessions.filter((session) => {
-    const updatedAt = Date.parse(session.updatedAt);
+    const updatedAt = Date.parse(session.fileUpdatedAt || session.updatedAt);
     return Number.isFinite(updatedAt) && updatedAt >= cutoff;
   });
 
@@ -566,7 +646,7 @@ function guardActiveSessions(sessions, options, action) {
 
   const lines = active
     .slice(0, 5)
-    .map((session) => `- ${session.shortId} updated ${formatDate(session.updatedAt)} ${session.file}`);
+    .map((session) => `- ${session.shortId} updated ${formatDate(session.fileUpdatedAt || session.updatedAt)} ${session.file}`);
   throw new Error(
     `Refusing to ${action} session(s) updated within the last ${windowMinutes} minute(s).\n${lines.join(
       "\n",
@@ -604,6 +684,7 @@ Usage:
   coldxx drop <session> --lines RANGE [--yes] [--dry-run]
   coldxx ui [--host 127.0.0.1] [--port 4765]
   coldxx trash [list|restore <trash-id>|empty] [--yes]
+  coldxx profiles [list|show <name>|save <name> --file <config.toml> --yes]
   coldxx doctor
 
 Selectors:
@@ -634,6 +715,8 @@ Examples:
   coldxx clean a1111111 --yes
   coldxx edit latest --replace API_KEY --with "[REDACTED]" --scope messages --yes
   coldxx drop latest --lines 12-18 --dry-run
+  coldxx profiles list
+  coldxx profiles save ctf --file ./ctf.config.toml --yes
   coldxx ui
 `;
 }

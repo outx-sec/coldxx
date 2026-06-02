@@ -6,8 +6,12 @@ import {
   emptyTrash,
   formatBytes,
   getSessionTurnEditPlan,
+  deleteCodexProfile,
+  listCodexConfigs,
   listBackups,
   listTrash,
+  readCodexBaseConfig,
+  readCodexProfile,
   readJsonl,
   readSessionForEditing,
   readSessionRecordForEditing,
@@ -19,9 +23,11 @@ import {
   restoreTrashBatch,
   scanSessions,
   sessionIsActive,
+  rewriteText,
   truncateSessionAfterTurn,
   updateSessionRecord,
   updateSessionTurnMessages,
+  writeCodexProfile,
 } from "./core.js";
 
 const DEFAULT_ACTIVE_WINDOW_MINUTES = 10;
@@ -91,6 +97,10 @@ async function route(req, res, state) {
   const url = new URL(req.url || "/", "http://localhost");
 
   if (req.method === "GET" && url.pathname === "/") {
+    if (!isAuthorized(req, url, state.token)) {
+      sendJson(res, 403, { error: "Invalid UI token" });
+      return;
+    }
     sendHtml(res, html(state));
     return;
   }
@@ -107,6 +117,65 @@ async function route(req, res, state) {
 
   if (!isAuthorized(req, url, state.token)) {
     sendJson(res, 403, { error: "Invalid UI token" });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/profiles") {
+    const configs = await listCodexConfigs({ codexHome: state.codexHome });
+    const [base, ...profiles] = configs;
+    sendJson(res, 200, {
+      base,
+      profiles,
+      configs,
+      codexHome: state.codexHome,
+    });
+    return;
+  }
+
+  const profileMatch = /^\/api\/profiles\/([^/]+)$/.exec(url.pathname);
+  if (profileMatch) {
+    const name = decodeURIComponent(profileMatch[1]);
+    if (req.method === "GET") {
+      const profile =
+        name === "default"
+          ? await readCodexBaseConfig({ codexHome: state.codexHome })
+          : await readCodexProfile(name, { codexHome: state.codexHome });
+      sendJson(res, 200, { profile });
+      return;
+    }
+
+    if (req.method === "PUT") {
+      if (name === "default") {
+        sendJson(res, 400, { error: "Default config.toml is read-only in coldxx" });
+        return;
+      }
+      const body = await readJsonBody(req);
+      const result = await writeCodexProfile(name, {
+        codexHome: state.codexHome,
+        managerHome: state.managerHome,
+        raw: typeof body.raw === "string" ? body.raw : "",
+        instructions: typeof body.instructions === "string" ? body.instructions : undefined,
+        modelInstructionsText:
+          typeof body.modelInstructionsText === "string" ? body.modelInstructionsText : undefined,
+      });
+      sendJson(res, 200, { profile: result });
+      return;
+    }
+
+    if (req.method === "DELETE") {
+      if (name === "default") {
+        sendJson(res, 400, { error: "Default config.toml cannot be deleted from coldxx" });
+        return;
+      }
+      const result = await deleteCodexProfile(name, {
+        codexHome: state.codexHome,
+        managerHome: state.managerHome,
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+
+    sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
@@ -203,7 +272,7 @@ async function route(req, res, state) {
     return;
   }
 
-  const turnMatch = /^\/api\/sessions\/([^/]+)\/turns\/([^/]+)\/(edit|truncate)$/.exec(url.pathname);
+  const turnMatch = /^\/api\/sessions\/([^/]+)\/turns\/([^/]+)\/(edit|truncate|rewrite-text)$/.exec(url.pathname);
   if (turnMatch) {
     const session = await resolveSession(decodeURIComponent(turnMatch[1]), state);
     const turnId = decodeURIComponent(turnMatch[2]);
@@ -230,6 +299,23 @@ async function route(req, res, state) {
       guardActiveSession(session, state, body.allowActive, "truncate this session");
       const result = await truncateSessionAfterTurn(session.file, turnId, {
         managerHome: state.managerHome,
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && action === "rewrite-text") {
+      const body = await readJsonBody(req);
+      const result = await rewriteText(String(body.text || ""), {
+        llmProvider: String(body.llmProvider || ""),
+        codexHome: state.codexHome,
+        cwd: session.cwd || undefined,
+        prompt: String(body.prompt || ""),
+        profile: String(body.profile || ""),
+        model: String(body.model || ""),
+        baseUrl: String(body.baseUrl || ""),
+        apiKey: String(body.apiKey || ""),
+        side: String(body.side || ""),
       });
       sendJson(res, 200, result);
       return;
@@ -370,6 +456,7 @@ function publicSession(session, state) {
     relativePath: session.relativePath,
     startedAt: session.startedAt,
     updatedAt: session.updatedAt,
+    fileUpdatedAt: session.fileUpdatedAt,
     sizeBytes: session.sizeBytes,
     size: formatBytes(session.sizeBytes || 0),
     lines: session.lines,
@@ -584,9 +671,27 @@ function html(state) {
       background: var(--accent-soft);
     }
 
+    button.is-rewriting {
+      opacity: 1;
+    }
+
+    button.is-rewriting::before {
+      content: "";
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(255, 255, 255, 0.45);
+      border-top-color: #fff;
+      border-radius: 999px;
+      animation: rewrite-spin 720ms linear infinite;
+    }
+
     button:disabled {
       cursor: not-allowed;
       opacity: 0.55;
+    }
+
+    button.is-rewriting:disabled {
+      opacity: 1;
     }
 
     input,
@@ -652,7 +757,7 @@ function html(state) {
       display: flex;
       justify-content: flex-end;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
       flex-wrap: wrap;
     }
 
@@ -1423,6 +1528,78 @@ function html(state) {
       transform: translateX(16px);
     }
 
+    .active-session-toggle {
+      position: relative;
+      width: 30px;
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: linear-gradient(180deg, #fff, #f7faf9);
+      color: var(--muted);
+      cursor: pointer;
+      transition: background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+    }
+
+    .active-session-toggle:hover {
+      border-color: #9fb0b4;
+      background: linear-gradient(180deg, #fff, #f1f6f5);
+      color: var(--ink);
+    }
+
+    .active-session-toggle.active {
+      color: #fff;
+      border-color: var(--warn);
+      background: linear-gradient(180deg, #b57422, var(--warn));
+      box-shadow: 0 1px 2px rgba(154, 97, 18, 0.2);
+    }
+
+    .active-session-toggle input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .active-session-toggle input:focus-visible + .active-session-icon {
+      outline: 2px solid rgba(13, 107, 96, 0.45);
+      outline-offset: 4px;
+      border-radius: 5px;
+    }
+
+    .active-session-icon {
+      width: 17px;
+      height: 17px;
+      display: inline-grid;
+      place-items: center;
+    }
+
+    .active-session-icon svg {
+      grid-area: 1 / 1;
+      width: 17px;
+      height: 17px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .active-session-toggle .icon-unlocked {
+      display: none;
+    }
+
+    .active-session-toggle.active .icon-locked {
+      display: none;
+    }
+
+    .active-session-toggle.active .icon-unlocked {
+      display: block;
+    }
+
     .checks input {
       height: auto;
       margin: 0 5px 0 0;
@@ -1848,7 +2025,7 @@ function html(state) {
       padding: 10px 12px;
       font-size: 13px;
       transition: opacity 180ms ease, transform 180ms ease;
-      z-index: 10;
+      z-index: 60;
     }
 
     .toast.show {
@@ -2007,6 +2184,12 @@ function html(state) {
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
+    .modal-field textarea.raw-config {
+      min-height: 220px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
     .modal-layer.wide .modal-field textarea {
       min-height: 156px;
       max-height: 360px;
@@ -2058,6 +2241,51 @@ function html(state) {
       flex-wrap: wrap;
     }
 
+    .settings-shell {
+      display: grid;
+      gap: 10px;
+    }
+
+    .settings-tabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+    }
+
+    .settings-tab {
+      height: 30px;
+      padding: 0 10px;
+      font-size: 12px;
+    }
+
+    .settings-panel[hidden] {
+      display: none;
+    }
+
+    .settings-subpanel[hidden] {
+      display: none;
+    }
+
+    .rewrite-popover {
+      position: fixed;
+      display: grid;
+      gap: 9px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      box-shadow: var(--shadow);
+      z-index: 30;
+    }
+
+    .rewrite-popover textarea {
+      min-height: 112px;
+      max-height: 220px;
+      resize: vertical;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
     .turn-edit-section {
       display: grid;
       gap: 8px;
@@ -2073,6 +2301,115 @@ function html(state) {
     .turn-edit-target {
       color: var(--muted);
       font-weight: 400;
+    }
+
+    .turn-edit-row-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .turn-edit-row-head label {
+      min-width: 0;
+    }
+
+    .turn-edit-actions {
+      flex: 0 0 auto;
+      gap: 6px;
+    }
+
+    .turn-edit-row {
+      position: relative;
+    }
+
+    .turn-edit-row textarea {
+      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+
+    .turn-edit-row.is-rewriting textarea {
+      border-color: rgba(13, 107, 96, 0.55);
+      background: #f7fbfa;
+      box-shadow: 0 0 0 3px rgba(13, 107, 96, 0.08);
+    }
+
+    .turn-edit-row textarea.rewrite-replaced {
+      animation: rewrite-replace-flash 900ms ease;
+    }
+
+    .turn-edit-progress {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      min-height: 18px;
+      color: #405058;
+      font-size: 12px;
+      overflow: hidden;
+    }
+
+    .turn-edit-row.is-rewriting .turn-edit-progress {
+      display: flex;
+    }
+
+    .turn-edit-progress-track {
+      position: relative;
+      flex: 1;
+      height: 4px;
+      border-radius: 999px;
+      background: #e5eeee;
+      overflow: hidden;
+    }
+
+    .turn-edit-progress-track::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 36%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, rgba(13, 107, 96, 0.18), rgba(13, 107, 96, 0.86), rgba(13, 107, 96, 0.18));
+      animation: rewrite-progress 1.05s ease-in-out infinite;
+    }
+
+    .turn-edit-progress-text {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    .modal-layer.rewrite-running .modal-foot,
+    .modal-layer.rewrite-running .modal-head {
+      opacity: 0.9;
+    }
+
+    @keyframes rewrite-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    @keyframes rewrite-progress {
+      0% {
+        transform: translateX(-110%);
+      }
+      100% {
+        transform: translateX(285%);
+      }
+    }
+
+    @keyframes rewrite-replace-flash {
+      0% {
+        background: #e9f8f4;
+        border-color: rgba(13, 107, 96, 0.8);
+        box-shadow: 0 0 0 4px rgba(13, 107, 96, 0.16);
+      }
+      68% {
+        background: #f7fbfa;
+        border-color: rgba(13, 107, 96, 0.55);
+        box-shadow: 0 0 0 3px rgba(13, 107, 96, 0.08);
+      }
+      100% {
+        background: #fff;
+        box-shadow: none;
+      }
     }
 
     .modal-error {
@@ -2177,8 +2514,21 @@ function html(state) {
         <div class="pathline" id="pathline"></div>
       </div>
       <div class="top-actions">
+        <button class="compact" id="settingsButton" title="系统设置">设置</button>
         <button class="compact" id="resetLayoutButton" title="恢复默认栏宽和 Trash 高度">重置布局</button>
-        <label class="switch"><input type="checkbox" id="allowActive"><span>允许修改活跃 session</span></label>
+        <label class="active-session-toggle" id="allowActiveToggle" title="禁止修改最近活跃 session。点击后允许写入最近 ${Number(state.activeWindowMinutes) || DEFAULT_ACTIVE_WINDOW_MINUTES} 分钟内更新的 session。">
+          <input type="checkbox" id="allowActive" aria-label="允许修改活跃 session">
+          <span class="active-session-icon" aria-hidden="true">
+            <svg class="icon-locked" viewBox="0 0 24 24">
+              <rect x="5" y="11" width="14" height="10" rx="2"></rect>
+              <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
+            </svg>
+            <svg class="icon-unlocked" viewBox="0 0 24 24">
+              <rect x="5" y="11" width="14" height="10" rx="2"></rect>
+              <path d="M8 11V8a4 4 0 0 1 7.6-1.7"></path>
+            </svg>
+          </span>
+        </label>
       </div>
     </header>
     <main class="workspace" id="workspace">
@@ -2334,6 +2684,9 @@ function html(state) {
     const PANE_LAYOUT_KEY = 'coldxx-pane-layout-v1';
     const JSON_WRAP_KEY = 'coldxx-json-wrap-v2';
     const TRASH_HEIGHT_KEY = 'coldxx-trash-height-v1';
+    const REWRITE_SETTINGS_KEY = 'coldxx-rewrite-settings-v1';
+    const ALLOW_ACTIVE_KEY = 'coldxx-allow-active-v1';
+    const DEFAULT_REWRITE_PROMPT = '请将这段文本改写得更清晰、准确、便于继续工作。保留原意，不添加原文没有的信息。只输出改写后的文本。';
     const MAX_WRAPPED_JSON_CHARS = 250000;
     const MAX_JSON_AUTOLOAD_BYTES = 256 * 1024;
     const MAX_JSON_LIVE_VALIDATE_CHARS = 1000000;
@@ -2362,6 +2715,11 @@ function html(state) {
       modalResolver: null,
       modalCollect: null,
       lastModalFocus: null,
+      turnRewriteBusy: '',
+      profiles: [],
+      profileConfigs: [],
+      activeSettingsTab: 'profiles',
+      rewriteSettings: loadRewriteSettings(),
       trashItems: []
     };
 
@@ -2374,8 +2732,10 @@ function html(state) {
       sessionSearchRow: document.getElementById('sessionSearchRow'),
       toggleSessionSearchButton: document.getElementById('toggleSessionSearchButton'),
       refreshSessions: document.getElementById('refreshSessions'),
+      settingsButton: document.getElementById('settingsButton'),
       resetLayoutButton: document.getElementById('resetLayoutButton'),
       allowActive: document.getElementById('allowActive'),
+      allowActiveToggle: document.getElementById('allowActiveToggle'),
       sessionCount: document.getElementById('sessionCount'),
       sessionList: document.getElementById('sessionList'),
       selectAllSessionsButton: document.getElementById('selectAllSessionsButton'),
@@ -2471,6 +2831,351 @@ function html(state) {
       setStatus('');
       if (!state.selectedSession && state.sessions[0]) {
         await selectSession(state.sessions[0].id);
+      }
+    }
+
+    async function loadProfiles() {
+      const data = await api('/api/profiles');
+      state.profiles = data.profiles || [];
+      state.profileConfigs = data.configs || [];
+      return state.profileConfigs;
+    }
+
+    async function openSystemSettingsModal() {
+      const configs = await loadProfiles();
+      const initial = configs[0] ? await api('/api/profiles/' + encodeURIComponent(configs[0].name)) : { profile: defaultConfigView() };
+      state.activeSettingsTab = state.activeSettingsTab || 'profiles';
+      const result = await openModal({
+        kicker: 'Settings',
+        title: '系统设置',
+        body: systemSettingsModalBody(configs, initial.profile),
+        size: 'wide',
+        confirmText: '保存当前 profile',
+        cancelText: '关闭',
+        afterOpen: setupSystemSettingsModal,
+        collect: collectSystemSettingsModal
+      });
+      if (!result) {
+        return;
+      }
+      if (result.type === 'profile') {
+        await saveProfile(result.profile);
+      } else if (result.type === 'rewrite') {
+        saveRewriteSettings(result.settings);
+        showToast('改写 AI 设置已保存', 'ok');
+      }
+    }
+
+    async function saveProfile(profile) {
+      setStatus('Saving Codex profile...');
+      const response = await api('/api/profiles/' + encodeURIComponent(profile.name), {
+        method: 'PUT',
+        body: JSON.stringify({
+          raw: profile.raw,
+          instructions: profile.useInstructions ? profile.instructions : undefined,
+          modelInstructionsText: profile.useModelInstructions ? profile.modelInstructionsText : undefined
+        })
+      });
+      const saved = response.profile;
+      await loadProfiles();
+      const message = '已保存 ' + saved.file + ' · 使用：' + saved.command;
+      setStatus(message, 'ok', true);
+      showToast(message, 'ok');
+    }
+
+    function setupSystemSettingsModal() {
+      for (const button of document.querySelectorAll('[data-settings-tab]')) {
+        button.addEventListener('click', () => switchSettingsTab(button.dataset.settingsTab));
+      }
+      setupProfileModal();
+      setupRewriteSettingsForm();
+      switchSettingsTab(state.activeSettingsTab || 'profiles');
+    }
+
+    function switchSettingsTab(tab) {
+      state.activeSettingsTab = tab || 'profiles';
+      for (const button of document.querySelectorAll('[data-settings-tab]')) {
+        button.classList.toggle('active', button.dataset.settingsTab === state.activeSettingsTab);
+      }
+      for (const panel of document.querySelectorAll('[data-settings-panel]')) {
+        panel.hidden = panel.dataset.settingsPanel !== state.activeSettingsTab;
+      }
+      if (state.activeSettingsTab === 'profiles') {
+        els.modalConfirmButton.textContent = '保存当前 profile';
+        els.modalConfirmButton.className = 'primary compact';
+        updateProfileFormState();
+      } else if (state.activeSettingsTab === 'rewrite') {
+        els.modalConfirmButton.disabled = false;
+        els.modalConfirmButton.textContent = '保存改写设置';
+        els.modalConfirmButton.className = 'primary compact';
+      }
+    }
+
+    function collectSystemSettingsModal() {
+      if (state.activeSettingsTab === 'profiles') {
+        const profile = collectProfileModal();
+        return profile ? { type: 'profile', profile } : false;
+      }
+      if (state.activeSettingsTab === 'rewrite') {
+        return { type: 'rewrite', settings: collectRewriteSettingsForm() };
+      }
+      return false;
+    }
+
+    function setupProfileModal() {
+      const selector = document.getElementById('profileSelector');
+      if (selector) {
+        selector.addEventListener('change', () => {
+          if (selector.value) {
+            loadProfileIntoModal(selector.value).catch(handleError);
+          } else {
+            startNewProfile();
+          }
+        });
+      }
+      const nameInput = document.getElementById('profileNameInput');
+      if (nameInput) {
+        nameInput.addEventListener('input', updateProfileActivationHint);
+      }
+      document.getElementById('profileNewButton').addEventListener('click', startNewProfile);
+      document.getElementById('profileDeleteButton').addEventListener('click', () => {
+        deleteSelectedProfile().catch(handleError);
+      });
+      updateProfileActivationHint();
+      updateProfileFormState();
+    }
+
+    function startNewProfile() {
+      fillProfileModal({
+        name: '',
+        kind: 'profile',
+        editable: true,
+        deletable: false,
+        raw: defaultProfileRaw(),
+        fields: {},
+        modelInstructionsText: ''
+      });
+      setProfileSelectorValue('');
+      document.getElementById('profileNameInput').focus();
+    }
+
+    async function loadProfileIntoModal(name) {
+      const data = await api('/api/profiles/' + encodeURIComponent(name));
+      fillProfileModal(data.profile);
+    }
+
+    function fillProfileModal(profile) {
+      document.getElementById('profileKind').value = profile.kind || 'profile';
+      document.getElementById('profileEditable').value = profile.editable ? '1' : '0';
+      document.getElementById('profileDeletable').value = profile.deletable ? '1' : '0';
+      document.getElementById('profileNameInput').value = profile.name || '';
+      document.getElementById('profileRawToml').value = profile.raw || '';
+      document.getElementById('profileInstructions').value =
+        (profile.fields && profile.fields.instructions) || '';
+      document.getElementById('profileUseInstructions').checked =
+        Boolean(profile.fields && profile.fields.instructions);
+      document.getElementById('profileModelInstructions').value = profile.modelInstructionsText || '';
+      document.getElementById('profileUseModelInstructions').checked =
+        Boolean(profile.fields && profile.fields.model_instructions_file);
+      updateProfileActivationHint();
+      setProfileSelectorValue(profile.name || '');
+      updateProfileFormState();
+    }
+
+    function collectProfileModal() {
+      if (document.getElementById('profileEditable').value !== '1') {
+        return false;
+      }
+      const name = document.getElementById('profileNameInput').value.trim();
+      const error = document.getElementById('profileModalError');
+      if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+        error.textContent = 'Profile 名只能包含字母、数字、连字符和下划线。';
+        error.classList.add('show');
+        return false;
+      }
+      error.classList.remove('show');
+      return {
+        name,
+        raw: document.getElementById('profileRawToml').value,
+        useInstructions: document.getElementById('profileUseInstructions').checked,
+        instructions: document.getElementById('profileInstructions').value,
+        useModelInstructions: document.getElementById('profileUseModelInstructions').checked,
+        modelInstructionsText: document.getElementById('profileModelInstructions').value
+      };
+    }
+
+    async function deleteSelectedProfile() {
+      const name = document.getElementById('profileNameInput').value.trim();
+      if (document.getElementById('profileDeletable').value !== '1' || !name) {
+        return;
+      }
+      if (!window.confirm('删除 Codex profile ' + name + '？删除前会自动备份。')) {
+        return;
+      }
+      const result = await api('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+      const configs = await loadProfiles();
+      const selector = document.getElementById('profileSelector');
+      if (selector) {
+        selector.innerHTML = profileSelectorOptions(configs, 'default');
+      }
+      fillProfileModal(configs[0] || defaultConfigView());
+      showToast('已删除 ' + result.file + '，备份：' + (result.backup ? result.backup.backupPath : '-'), 'ok');
+    }
+
+    function updateProfileFormState() {
+      const editable = document.getElementById('profileEditable').value === '1';
+      const deletable = document.getElementById('profileDeletable').value === '1';
+      const inputs = [
+        document.getElementById('profileNameInput'),
+        document.getElementById('profileRawToml'),
+        document.getElementById('profileInstructions'),
+        document.getElementById('profileModelInstructions'),
+        document.getElementById('profileUseInstructions'),
+        document.getElementById('profileUseModelInstructions')
+      ];
+      for (const input of inputs) {
+        input.disabled = !editable;
+      }
+      document.getElementById('profileDeleteButton').disabled = !deletable;
+      if (state.activeSettingsTab === 'profiles') {
+        els.modalConfirmButton.disabled = !editable;
+        els.modalConfirmButton.textContent = editable ? '保存当前 profile' : '默认配置只读';
+      }
+    }
+
+    function updateProfileActivationHint() {
+      const input = document.getElementById('profileNameInput');
+      const hint = document.getElementById('profileActivationHint');
+      if (!input || !hint) {
+        return;
+      }
+      if (document.getElementById('profileKind').value === 'default') {
+        hint.textContent = '默认配置通过 codex 直接使用；coldxx 只展示，不保存或删除 config.toml。';
+        return;
+      }
+      const name = input.value.trim() || '<profile>';
+      hint.textContent = '保存后使用：codex -p ' + name + '，非交互：codex exec -p ' + name + ' "..."';
+    }
+
+    function setProfileSelectorValue(name) {
+      const selector = document.getElementById('profileSelector');
+      if (!selector) {
+        return;
+      }
+      selector.value = Array.from(selector.options).some((option) => option.value === name) ? name : '';
+    }
+
+    function defaultConfigView() {
+      return {
+        name: 'default',
+        kind: 'default',
+        editable: false,
+        deletable: false,
+        raw: '',
+        fields: {},
+        modelInstructionsText: '',
+        command: 'codex'
+      };
+    }
+
+    function defaultProfileRaw() {
+      return '#:schema https://developers.openai.com/codex/config-schema.json\\n# Activate with: codex -p <profile>\\n\\nmodel = "gpt-5.5"\\napproval_policy = "on-request"\\nsandbox_mode = "workspace-write"\\n';
+    }
+
+    function defaultRewriteSettings() {
+      return {
+        llmProvider: 'codex',
+        profile: '',
+        codexModel: '',
+        compatibleModel: '',
+        baseUrl: '',
+        apiKey: '',
+        prompt: DEFAULT_REWRITE_PROMPT
+      };
+    }
+
+    function normalizeRewriteSettings(value) {
+      const fallback = defaultRewriteSettings();
+      const settings = value && typeof value === 'object' ? value : {};
+      const provider = ['codex', 'openai', 'anthropic'].includes(String(settings.llmProvider || settings.provider || '').toLowerCase())
+        ? String(settings.llmProvider || settings.provider).toLowerCase()
+        : fallback.llmProvider;
+      return {
+        llmProvider: provider,
+        profile: typeof settings.profile === 'string' ? settings.profile : fallback.profile,
+        codexModel:
+          typeof settings.codexModel === 'string'
+            ? settings.codexModel
+            : provider === 'codex' && typeof settings.model === 'string'
+              ? settings.model
+              : fallback.codexModel,
+        compatibleModel:
+          typeof settings.compatibleModel === 'string'
+            ? settings.compatibleModel
+            : provider !== 'codex' && typeof settings.model === 'string'
+              ? settings.model
+              : fallback.compatibleModel,
+        baseUrl: typeof settings.baseUrl === 'string' ? settings.baseUrl : fallback.baseUrl,
+        apiKey: typeof settings.apiKey === 'string' ? settings.apiKey : fallback.apiKey,
+        prompt: typeof settings.prompt === 'string' && settings.prompt.trim() ? settings.prompt : fallback.prompt
+      };
+    }
+
+    function loadRewriteSettings() {
+      try {
+        return normalizeRewriteSettings(JSON.parse(localStorage.getItem(REWRITE_SETTINGS_KEY) || 'null'));
+      } catch {
+        return defaultRewriteSettings();
+      }
+    }
+
+    function saveRewriteSettings(settings) {
+      state.rewriteSettings = normalizeRewriteSettings(settings);
+      try {
+        localStorage.setItem(REWRITE_SETTINGS_KEY, JSON.stringify(state.rewriteSettings));
+      } catch {
+        // Ignore storage failures; the current page still uses the updated settings.
+      }
+    }
+
+    function collectRewriteSettingsForm() {
+      const llmProvider = document.getElementById('rewriteSettingProvider').value;
+      return normalizeRewriteSettings({
+        llmProvider,
+        profile: document.getElementById('rewriteSettingProfile').value,
+        codexModel: document.getElementById('rewriteSettingCodexModel').value.trim(),
+        compatibleModel: document.getElementById('rewriteSettingModel').value.trim(),
+        baseUrl: document.getElementById('rewriteSettingBaseUrl').value.trim(),
+        apiKey: document.getElementById('rewriteSettingApiKey').value,
+        prompt: document.getElementById('rewriteSettingPrompt').value
+      });
+    }
+
+    function setupRewriteSettingsForm() {
+      const provider = document.getElementById('rewriteSettingProvider');
+      if (provider) {
+        provider.addEventListener('change', updateRewriteProviderFields);
+        updateRewriteProviderFields();
+      }
+    }
+
+    function updateRewriteProviderFields() {
+      const provider = document.getElementById('rewriteSettingProvider');
+      if (!provider) {
+        return;
+      }
+      const value = provider.value || 'codex';
+      const codexPanel = document.querySelector('[data-rewrite-settings-panel="codex"]');
+      const compatiblePanel = document.querySelector('[data-rewrite-settings-panel="compatible"]');
+      if (codexPanel) {
+        codexPanel.hidden = value !== 'codex';
+      }
+      if (compatiblePanel) {
+        compatiblePanel.hidden = value === 'codex';
+      }
+      const baseUrl = document.getElementById('rewriteSettingBaseUrl');
+      if (baseUrl) {
+        baseUrl.placeholder = value === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1';
       }
     }
 
@@ -3120,6 +3825,7 @@ function html(state) {
       if (!state.selectedSession) {
         return;
       }
+      await loadProfiles();
       const data = await api(sessionApiPath(state.selectedSession, '/turns/' + encodeURIComponent(turnId) + '/edit'));
       const groups = data.groups || [];
       if (groups.length === 0) {
@@ -3133,6 +3839,7 @@ function html(state) {
         size: 'wide',
         confirmText: '保存修改',
         cancelText: '取消',
+        afterOpen: () => setupTurnEditRewriteControls(turnId),
         collect: () => ({
           edits: Array.from(document.querySelectorAll('[data-turn-edit-group]')).map((textarea) => ({
             id: textarea.dataset.turnEditGroup,
@@ -3144,6 +3851,156 @@ function html(state) {
         return;
       }
       await saveTurnMessages(turnId, result.edits);
+    }
+
+    function setupTurnEditRewriteControls(turnId) {
+      for (const textarea of document.querySelectorAll('[data-turn-edit-group]')) {
+        textarea.addEventListener('input', () => updateTurnRestoreButton(textarea.dataset.turnEditGroup));
+      }
+      for (const button of document.querySelectorAll('[data-rewrite-group]')) {
+        button.addEventListener('click', () => openRewritePromptPopover(turnId, button));
+      }
+      for (const button of document.querySelectorAll('[data-restore-rewrite-group]')) {
+        button.addEventListener('click', () => {
+          if (state.turnRewriteBusy) {
+            showToast('改写进行中，请等待完成', 'error');
+            return;
+          }
+          const id = button.dataset.restoreRewriteGroup;
+          const input = document.querySelector('[data-turn-edit-group="' + cssEscape(id) + '"]');
+          if (input) {
+            input.value = input.dataset.originalText || '';
+            updateTurnRestoreButton(id);
+          }
+        });
+      }
+    }
+
+    function updateTurnRestoreButton(id) {
+      const input = document.querySelector('[data-turn-edit-group="' + cssEscape(id) + '"]');
+      const restoreButton = document.querySelector('[data-restore-rewrite-group="' + cssEscape(id) + '"]');
+      if (input && restoreButton) {
+        restoreButton.disabled = Boolean(state.turnRewriteBusy) || input.value === (input.dataset.originalText || '');
+      }
+    }
+
+    function openRewritePromptPopover(turnId, button) {
+      closeRewritePromptPopover();
+      const id = button.dataset.rewriteGroup;
+      const input = document.querySelector('[data-turn-edit-group="' + cssEscape(id) + '"]');
+      if (!input || !input.value.trim()) {
+        showToast('没有可改写的文本', 'error');
+        return;
+      }
+      const popover = document.createElement('div');
+      popover.className = 'rewrite-popover';
+      popover.id = 'rewritePromptPopover';
+      popover.innerHTML =
+        '<div class="modal-field">' +
+        '<label for="rewritePromptInput">改写提示词</label>' +
+        '<textarea id="rewritePromptInput">' + escapeHtml((state.rewriteSettings && state.rewriteSettings.prompt) || DEFAULT_REWRITE_PROMPT) + '</textarea>' +
+        '</div>' +
+        '<div class="modal-inline">' +
+        '<button type="button" class="primary compact" id="rewritePromptRun">改写</button>' +
+        '<button type="button" class="compact" id="rewritePromptCancel">取消</button>' +
+        '</div>';
+      document.body.appendChild(popover);
+      const rect = button.getBoundingClientRect();
+      const width = Math.min(380, window.innerWidth - 24);
+      const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+      const top = Math.max(12, Math.min(rect.bottom + 8, window.innerHeight - 260));
+      popover.style.width = width + 'px';
+      popover.style.left = left + 'px';
+      popover.style.top = top + 'px';
+      document.getElementById('rewritePromptCancel').addEventListener('click', closeRewritePromptPopover);
+      document.getElementById('rewritePromptRun').addEventListener('click', () => {
+        const prompt = document.getElementById('rewritePromptInput').value;
+        closeRewritePromptPopover();
+        rewriteTurnEditGroup(turnId, button, prompt).catch(handleError);
+      });
+      setTimeout(() => document.getElementById('rewritePromptInput').focus(), 0);
+    }
+
+    function closeRewritePromptPopover() {
+      const popover = document.getElementById('rewritePromptPopover');
+      if (popover) {
+        popover.remove();
+      }
+    }
+
+    async function rewriteTurnEditGroup(turnId, button, prompt) {
+      const id = button.dataset.rewriteGroup;
+      const input = document.querySelector('[data-turn-edit-group="' + cssEscape(id) + '"]');
+      if (!input || !input.value.trim()) {
+        showToast('没有可改写的文本', 'error');
+        return;
+      }
+      setTurnRewriteBusy(id, true);
+      setStatus('正在改写文本...', 'ok');
+      try {
+        const result = await api(sessionApiPath(state.selectedSession, '/turns/' + encodeURIComponent(turnId) + '/rewrite-text'), {
+          method: 'POST',
+          body: JSON.stringify(collectTurnRewriteOptions(input.value, button.dataset.rewriteSide, prompt))
+        });
+        input.value = result.output || input.value;
+        updateTurnRestoreButton(id);
+        animateTurnRewriteReplacement(input);
+        setStatus('改写完成，保存弹窗后才会写回 session。', 'ok', true);
+      } catch (error) {
+        handleError(error);
+      } finally {
+        setTurnRewriteBusy(id, false);
+      }
+    }
+
+    function setTurnRewriteBusy(id, busy) {
+      state.turnRewriteBusy = busy ? id : '';
+      els.modalLayer.classList.toggle('rewrite-running', busy);
+      els.modalConfirmButton.disabled = busy;
+      els.modalCancelButton.disabled = busy;
+      els.modalCloseButton.disabled = busy;
+
+      for (const textarea of document.querySelectorAll('[data-turn-edit-group]')) {
+        textarea.disabled = busy;
+      }
+      for (const row of document.querySelectorAll('[data-turn-edit-row]')) {
+        row.classList.toggle('is-rewriting', busy && row.dataset.turnEditRow === id);
+      }
+      for (const rewriteButton of document.querySelectorAll('[data-rewrite-group]')) {
+        const isCurrent = rewriteButton.dataset.rewriteGroup === id;
+        rewriteButton.disabled = busy;
+        rewriteButton.classList.toggle('is-rewriting', busy && isCurrent);
+        rewriteButton.textContent = busy && isCurrent ? '改写中' : '改写';
+      }
+      for (const restoreButton of document.querySelectorAll('[data-restore-rewrite-group]')) {
+        restoreButton.disabled = busy || !isTurnEditGroupChanged(restoreButton.dataset.restoreRewriteGroup);
+      }
+    }
+
+    function isTurnEditGroupChanged(id) {
+      const input = document.querySelector('[data-turn-edit-group="' + cssEscape(id) + '"]');
+      return Boolean(input && input.value !== (input.dataset.originalText || ''));
+    }
+
+    function animateTurnRewriteReplacement(input) {
+      input.classList.remove('rewrite-replaced');
+      void input.offsetWidth;
+      input.classList.add('rewrite-replaced');
+      window.setTimeout(() => input.classList.remove('rewrite-replaced'), 950);
+    }
+
+    function collectTurnRewriteOptions(text, side, prompt) {
+      const settings = state.rewriteSettings || defaultRewriteSettings();
+      return {
+        text,
+        side,
+        llmProvider: settings.llmProvider,
+        profile: settings.profile,
+        model: settings.llmProvider === 'codex' ? settings.codexModel : settings.compatibleModel,
+        prompt: String(prompt || '').trim() || settings.prompt || DEFAULT_REWRITE_PROMPT,
+        baseUrl: settings.baseUrl,
+        apiKey: settings.apiKey
+      };
     }
 
     async function saveTurnMessages(turnId, edits) {
@@ -3616,8 +4473,13 @@ function html(state) {
       els.modalCancelButton.textContent = options.cancelText || '取消';
       els.modalConfirmButton.textContent = options.confirmText || '确认';
       els.modalConfirmButton.className = (options.variant === 'danger' ? 'danger' : 'primary') + ' compact';
+      els.modalConfirmButton.disabled = false;
+      els.modalCancelButton.disabled = false;
+      els.modalCloseButton.disabled = false;
+      state.turnRewriteBusy = '';
       state.modalCollect = options.collect || null;
       els.modalLayer.classList.toggle('wide', options.size === 'wide');
+      els.modalLayer.classList.remove('rewrite-running');
       els.modalLayer.classList.add('open');
       els.modalLayer.setAttribute('aria-hidden', 'false');
       if (typeof options.afterOpen === 'function') {
@@ -3637,6 +4499,7 @@ function html(state) {
       const resolve = state.modalResolver;
       state.modalResolver = null;
       state.modalCollect = null;
+      closeRewritePromptPopover();
       els.modalLayer.classList.remove('open');
       els.modalLayer.classList.remove('wide');
       els.modalLayer.setAttribute('aria-hidden', 'true');
@@ -3649,6 +4512,10 @@ function html(state) {
 
     function confirmModal() {
       if (!state.modalResolver) {
+        return;
+      }
+      if (state.turnRewriteBusy) {
+        showToast('改写进行中，完成后才能保存', 'error');
         return;
       }
       if (state.modalCollect) {
@@ -3783,6 +4650,123 @@ function html(state) {
         '<div class="modal-list">' + (rows || '<div class="empty">No manifest sessions</div>') + '</div>';
     }
 
+    function systemSettingsModalBody(configs, profile) {
+      return '<div class="settings-shell">' +
+        '<div class="settings-tabs" role="tablist">' +
+        '<button type="button" class="settings-tab" data-settings-tab="profiles">Profiles</button>' +
+        '<button type="button" class="settings-tab" data-settings-tab="rewrite">改写 AI</button>' +
+        '</div>' +
+        '<div class="settings-panel" data-settings-panel="profiles">' +
+        profileModalBody(configs, profile) +
+        '</div>' +
+        '<div class="settings-panel" data-settings-panel="rewrite" hidden>' +
+        rewriteSettingsPanel() +
+        '</div>' +
+        '</div>';
+    }
+
+    function profileModalBody(configs, profile) {
+      const fields = profile.fields || {};
+      const instructionText = fields.instructions || '';
+      return '<div class="modal-grid">' +
+        '<p>Profile 文件会保存为 <code>~/.codex/&lt;name&gt;.config.toml</code>，不会修改默认 <code>config.toml</code>。</p>' +
+        '<div class="modal-field">' +
+        '<label for="profileSelector">当前配置</label>' +
+        '<select id="profileSelector">' + profileSelectorOptions(configs, profile.name || 'default') + '</select>' +
+        '</div>' +
+        '<div class="modal-inline">' +
+        '<button type="button" class="compact" id="profileNewButton">新建 profile</button>' +
+        '<button type="button" class="danger compact" id="profileDeleteButton">删除当前 profile</button>' +
+        '</div>' +
+        '<input type="hidden" id="profileKind" value="' + escapeAttr(profile.kind || 'profile') + '">' +
+        '<input type="hidden" id="profileEditable" value="' + (profile.editable ? '1' : '0') + '">' +
+        '<input type="hidden" id="profileDeletable" value="' + (profile.deletable ? '1' : '0') + '">' +
+        '<div class="modal-field">' +
+        '<label for="profileNameInput">Profile 名称</label>' +
+        '<input id="profileNameInput" value="' + escapeAttr(profile.name || '') + '" placeholder="ctf / deep-review">' +
+        '<div class="modal-error" id="profileModalError">Profile 名无效。</div>' +
+        '<div class="meta" id="profileActivationHint"></div>' +
+        '</div>' +
+        '<div class="modal-inline">' +
+        checkboxHtml('instructions', '同步到 instructions', 'id="profileUseInstructions"', instructionText ? ['instructions'] : []) +
+        checkboxHtml('model', '写入 model_instructions_file（高级）', 'id="profileUseModelInstructions"', fields.model_instructions_file ? ['model'] : []) +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="profileInstructions">默认提示词（instructions）</label>' +
+        '<textarea id="profileInstructions" placeholder="额外注入到会话中的默认指令">' + escapeHtml(instructionText) + '</textarea>' +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="profileModelInstructions">覆盖内置 model instructions（高级）</label>' +
+        '<textarea id="profileModelInstructions" placeholder="启用后会保存到 ~/.codex/prompts/<profile>-model-instructions.md，并写入 model_instructions_file">' + escapeHtml(profile.modelInstructionsText || '') + '</textarea>' +
+        '<div class="modal-note">官方不建议随意覆盖内置 model instructions；一般默认提示词优先使用 instructions。</div>' +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="profileRawToml">Raw TOML</label>' +
+        '<textarea class="raw-config" id="profileRawToml" spellcheck="false">' + escapeHtml(profile.raw || defaultProfileRaw()) + '</textarea>' +
+        '</div>' +
+        '</div>';
+    }
+
+    function profileSelectorOptions(configs, selectedName) {
+      return '<option value="">新建 profile...</option>' + configs.map((item) => {
+        const title = item.kind === 'default' ? '默认 config.toml' : item.name;
+        const suffix = item.kind === 'default' ? ('只读 · ' + (item.exists ? '已存在' : '未创建')) : (item.size || 'profile');
+        return optionHtml(item.name, title + ' · ' + suffix, selectedName);
+      }).join('');
+    }
+
+    function rewriteSettingsPanel() {
+      const settings = state.rewriteSettings || defaultRewriteSettings();
+      let profileOptions = optionHtml('', '默认 config.toml', settings.profile);
+      if (settings.profile && !state.profiles.some((profile) => profile.name === settings.profile)) {
+        profileOptions += optionHtml(settings.profile, settings.profile + '（未找到）', settings.profile);
+      }
+      profileOptions += state.profiles.map((profile) => optionHtml(profile.name, profile.name, settings.profile)).join('');
+      return '<div class="modal-grid">' +
+        '<div class="modal-field">' +
+        '<label for="rewriteSettingProvider">LLM 后端</label>' +
+        '<select id="rewriteSettingProvider">' +
+        optionHtml('codex', '本地 Codex（默认）', settings.llmProvider) +
+        optionHtml('openai', 'OpenAI compatible', settings.llmProvider) +
+        optionHtml('anthropic', 'Anthropic compatible', settings.llmProvider) +
+        '</select>' +
+        '</div>' +
+        '<div class="modal-grid settings-subpanel" data-rewrite-settings-panel="codex">' +
+        '<div class="modal-note">默认使用本地 <code>codex exec --ephemeral</code> 完成改写；这里可以选择叠加哪个 Codex profile。</div>' +
+        '<div class="modal-inline">' +
+        '<div class="modal-field" style="min-width: 180px; flex: 1">' +
+        '<label for="rewriteSettingProfile">Codex profile</label>' +
+        '<select id="rewriteSettingProfile">' + profileOptions + '</select>' +
+        '</div>' +
+        '<div class="modal-field" style="min-width: 180px; flex: 1">' +
+        '<label for="rewriteSettingCodexModel">临时 model 覆盖</label>' +
+        '<input id="rewriteSettingCodexModel" value="' + escapeAttr(settings.codexModel) + '" placeholder="留空则使用所选配置">' +
+        '</div>' +
+        '</div>' +
+        '</div>' +
+        '<div class="modal-grid settings-subpanel" data-rewrite-settings-panel="compatible" hidden>' +
+        '<div class="modal-inline">' +
+        '<div class="modal-field" style="min-width: 180px; flex: 1">' +
+        '<label for="rewriteSettingBaseUrl">Base URL</label>' +
+        '<input id="rewriteSettingBaseUrl" value="' + escapeAttr(settings.baseUrl) + '" placeholder="https://api.openai.com/v1">' +
+        '</div>' +
+        '<div class="modal-field" style="min-width: 180px; flex: 1">' +
+        '<label for="rewriteSettingApiKey">API key</label>' +
+        '<input id="rewriteSettingApiKey" type="password" value="' + escapeAttr(settings.apiKey) + '" placeholder="本地兼容服务可留空">' +
+        '</div>' +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="rewriteSettingModel">Model</label>' +
+        '<input id="rewriteSettingModel" value="' + escapeAttr(settings.compatibleModel) + '" placeholder="gpt-4.1 / claude-sonnet-4-5">' +
+        '</div>' +
+        '</div>' +
+        '<div class="modal-field">' +
+        '<label for="rewriteSettingPrompt">默认改写提示词</label>' +
+        '<textarea id="rewriteSettingPrompt">' + escapeHtml(settings.prompt || DEFAULT_REWRITE_PROMPT) + '</textarea>' +
+        '</div>' +
+        '</div>';
+    }
+
     function turnEditModalBody(data) {
       const turn = data.turn || {};
       const groups = data.groups || [];
@@ -3800,10 +4784,23 @@ function html(state) {
     function turnEditSection(title, groups) {
       const rows = groups.map((group, index) => {
         const lineLabel = 'lines ' + group.lines.join(', ') + ' · ' + group.targetCount + ' target(s)';
-        return '<div class="modal-field">' +
+        const side = group.side || (title === '用户输入' ? 'user' : 'assistant');
+        const text = group.text || '';
+        return '<div class="modal-field turn-edit-row" data-turn-edit-row="' + escapeAttr(group.id) + '">' +
+          '<div class="turn-edit-row-head">' +
           '<label>' + escapeHtml(title + ' ' + (index + 1)) +
           ' <span class="turn-edit-target">' + escapeHtml(lineLabel) + '</span></label>' +
-          '<textarea data-turn-edit-group="' + escapeAttr(group.id) + '">' + escapeHtml(group.text || '') + '</textarea>' +
+          '<div class="modal-inline turn-edit-actions">' +
+          '<button type="button" class="primary compact" data-rewrite-group="' + escapeAttr(group.id) +
+          '" data-rewrite-side="' + escapeAttr(side) + '">改写</button>' +
+          '<button type="button" class="compact" data-restore-rewrite-group="' + escapeAttr(group.id) + '" disabled>恢复</button>' +
+          '</div>' +
+          '</div>' +
+          '<textarea data-turn-edit-group="' + escapeAttr(group.id) + '" data-original-text="' + escapeAttr(text) + '">' + escapeHtml(text) + '</textarea>' +
+          '<div class="turn-edit-progress" data-rewrite-progress="' + escapeAttr(group.id) + '">' +
+          '<span class="turn-edit-progress-track" aria-hidden="true"></span>' +
+          '<span class="turn-edit-progress-text">正在改写</span>' +
+          '</div>' +
           '</div>';
       }).join('');
       return '<div class="turn-edit-section">' +
@@ -3928,6 +4925,39 @@ function html(state) {
       els.jsonEditorShell.classList.toggle('large-json', (els.jsonEditor.value || '').length > MAX_WRAPPED_JSON_CHARS);
     }
 
+    function restoreAllowActive() {
+      let enabled = false;
+      try {
+        enabled = localStorage.getItem(ALLOW_ACTIVE_KEY) === 'true';
+      } catch {
+        enabled = false;
+      }
+      setAllowActive(enabled, { persist: false });
+    }
+
+    function setAllowActive(enabled, options = {}) {
+      els.allowActive.checked = Boolean(enabled);
+      if (options.persist !== false) {
+        try {
+          localStorage.setItem(ALLOW_ACTIVE_KEY, String(els.allowActive.checked));
+        } catch {
+          // Ignore storage failures; the current page still uses the updated switch state.
+        }
+      }
+      applyAllowActive();
+    }
+
+    function applyAllowActive() {
+      const enabled = els.allowActive.checked;
+      const title = enabled
+        ? '已允许修改活跃 session。仅在确认 Codex 不再写入该文件时使用。'
+        : '禁止修改最近活跃 session。点击后允许写入最近 ' + boot.activeWindowMinutes + ' 分钟内更新的 session。';
+      els.allowActiveToggle.classList.toggle('active', enabled);
+      els.allowActiveToggle.title = title;
+      els.allowActiveToggle.setAttribute('aria-label', title);
+      els.allowActive.setAttribute('aria-label', title);
+    }
+
     function restoreJsonWrap() {
       try {
         const saved = localStorage.getItem(JSON_WRAP_KEY);
@@ -4003,6 +5033,13 @@ function html(state) {
 
     function escapeAttr(value) {
       return escapeHtml(value);
+    }
+
+    function cssEscape(value) {
+      if (window.CSS && typeof window.CSS.escape === 'function') {
+        return window.CSS.escape(String(value));
+      }
+      return String(value).replace(/["\\\\]/g, '\\\\$&');
     }
 
     function selectedSessionIds() {
@@ -4318,6 +5355,8 @@ function html(state) {
     els.refreshSessions.addEventListener('click', () => loadSessions().catch(handleError));
     els.resetLayoutButton.addEventListener('click', resetPaneLayout);
     els.toggleSessionSearchButton.addEventListener('click', () => setSessionSearchOpen(!state.sessionSearchOpen));
+    els.settingsButton.addEventListener('click', () => openSystemSettingsModal().catch(handleError));
+    els.allowActive.addEventListener('change', () => setAllowActive(els.allowActive.checked));
     els.sessionSearch.addEventListener('input', debounce(() => {
       els.toggleSessionSearchButton.classList.toggle('active', Boolean(els.sessionSearch.value.trim()));
       loadSessions().catch(handleError);
@@ -4373,6 +5412,10 @@ function html(state) {
     els.modalCloseButton.addEventListener('click', () => closeModal(false));
     els.modalLayer.addEventListener('click', (event) => {
       if (event.target.closest('[data-modal-cancel]')) {
+        if (state.turnRewriteBusy) {
+          showToast('改写进行中，请等待完成', 'error');
+          return;
+        }
         closeModal(false);
       }
     });
@@ -4476,6 +5519,10 @@ function html(state) {
     window.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && state.modalResolver) {
         event.preventDefault();
+        if (state.turnRewriteBusy) {
+          showToast('改写进行中，请等待完成', 'error');
+          return;
+        }
         closeModal(false);
         return;
       }
@@ -4495,6 +5542,7 @@ function html(state) {
 
     restorePaneLayout();
     restoreTableLayout();
+    restoreAllowActive();
     restoreJsonWrap();
     restoreTrashHeight();
     renderOperationHistory();

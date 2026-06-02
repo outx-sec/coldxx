@@ -29,6 +29,9 @@ test("ui server lists sessions and updates one record", async (t) => {
   const origin = new URL(url).origin;
   const headers = { "x-coldxx-token": "test-token" };
 
+  const unauthenticatedHtmlResponse = await fetch(origin);
+  assert.equal(unauthenticatedHtmlResponse.status, 403);
+
   const htmlResponse = await fetch(url);
   assert.equal(htmlResponse.status, 200);
   const html = await htmlResponse.text();
@@ -40,6 +43,9 @@ test("ui server lists sessions and updates one record", async (t) => {
   assert.match(html, /choice-grid/);
   assert.match(html, /coldxx-pane-layout-v1/);
   assert.match(html, /resetLayoutButton/);
+  assert.match(html, /allowActiveToggle/);
+  assert.match(html, /active-session-toggle/);
+  assert.match(html, /coldxx-allow-active-v1/);
   assert.match(html, /trashResizer/);
   assert.match(html, /coldxx-trash-height-v1/);
   assert.match(html, /history-caret/);
@@ -55,9 +61,90 @@ test("ui server lists sessions and updates one record", async (t) => {
   assert.match(html, /data-edit-turn/);
   assert.match(html, /data-truncate-turn/);
   assert.match(html, /turn-edit-section/);
+  assert.match(html, /settingsButton/);
+  assert.match(html, /settings-tabs/);
+  assert.match(html, /profileSelector/);
+  assert.match(html, /rewriteSettingProvider/);
+  assert.match(html, /本地 Codex（默认）/);
+  assert.match(html, /OpenAI compatible/);
+  assert.match(html, /Anthropic compatible/);
+  assert.match(html, /rewriteSettingPrompt/);
+  assert.match(html, /rewriteSettingCodexModel/);
+  assert.match(html, /rewriteSettingModel/);
+  assert.match(html, /rewriteSettingBaseUrl/);
+  assert.match(html, /rewriteSettingApiKey/);
+  assert.doesNotMatch(html, /rewriteSettingOss/);
+  assert.doesNotMatch(html, /rewriteSettingLocalProvider/);
+  assert.match(html, /rewritePromptPopover/);
+  assert.match(html, /data-rewrite-group/);
+  assert.match(html, /data-restore-rewrite-group/);
+  assert.match(html, /turn-edit-row-head/);
+  assert.match(html, /turn-edit-progress/);
+  assert.match(html, /rewrite-running/);
+  assert.match(html, /rewrite-replaced/);
+  assert.match(html, /setTurnRewriteBusy/);
+  assert.match(html, /改写进行中，完成后才能保存/);
+  assert.match(html, /profileRawToml/);
+  assert.match(html, /profileDeleteButton/);
+  assert.match(html, /默认 config\.toml/);
   assert.match(html, /modalReplaceEnabled/);
   assert.match(html, /modalReplaceCaseSensitive/);
   assert.match(html, /modalFilterRegex/);
+
+  const profilesResponse = await fetch(`${origin}/api/profiles`, { headers });
+  assert.equal(profilesResponse.status, 200);
+  const profilesBody = await profilesResponse.json();
+  assert.equal(profilesBody.base.name, "default");
+  assert.equal(profilesBody.profiles.length, 0);
+  assert.equal(profilesBody.configs.length, 1);
+
+  const defaultProfileSaveResponse = await fetch(`${origin}/api/profiles/default`, {
+    method: "PUT",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ raw: 'model = "should-not-write"\n' }),
+  });
+  assert.equal(defaultProfileSaveResponse.status, 400);
+
+  const saveProfileResponse = await fetch(`${origin}/api/profiles/ctf`, {
+    method: "PUT",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({
+      raw: 'model = "gpt-5.5"\n',
+      instructions: "profile prompt",
+    }),
+  });
+  assert.equal(saveProfileResponse.status, 200);
+  const saveProfileBody = await saveProfileResponse.json();
+  assert.equal(saveProfileBody.profile.command, "codex -p ctf");
+  assert.match(saveProfileBody.profile.raw, /instructions/);
+
+  const profileResponse = await fetch(`${origin}/api/profiles/ctf`, { headers });
+  assert.equal(profileResponse.status, 200);
+  const profileBody = await profileResponse.json();
+  assert.equal(profileBody.profile.fields.instructions, "profile prompt");
+
+  const profilesAfterSaveResponse = await fetch(`${origin}/api/profiles`, { headers });
+  assert.equal(profilesAfterSaveResponse.status, 200);
+  const profilesAfterSaveBody = await profilesAfterSaveResponse.json();
+  assert.equal(profilesAfterSaveBody.profiles.length, 1);
+  assert.equal(profilesAfterSaveBody.configs.length, 2);
+
+  const defaultProfileDeleteResponse = await fetch(`${origin}/api/profiles/default`, {
+    method: "DELETE",
+    headers,
+  });
+  assert.equal(defaultProfileDeleteResponse.status, 400);
+
+  const deleteProfileResponse = await fetch(`${origin}/api/profiles/ctf`, {
+    method: "DELETE",
+    headers,
+  });
+  assert.equal(deleteProfileResponse.status, 200);
+  const profilesAfterDeleteResponse = await fetch(`${origin}/api/profiles`, { headers });
+  assert.equal(profilesAfterDeleteResponse.status, 200);
+  const profilesAfterDeleteBody = await profilesAfterDeleteResponse.json();
+  assert.equal(profilesAfterDeleteBody.profiles.length, 0);
+  assert.equal(profilesAfterDeleteBody.configs.length, 1);
 
   const sessionsResponse = await fetch(`${origin}/api/sessions`, { headers });
   assert.equal(sessionsResponse.status, 200);

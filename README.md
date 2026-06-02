@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime deps](https://img.shields.io/badge/runtime_deps-0-brightgreen.svg)](package.json)
 
-coldxx is a local Codex session manager. It reads JSONL session files from `~/.codex/sessions/YYYY/MM/DD/` and gives you a safer way to inspect, clean, back up, restore, and carefully edit history. Session contents stay on your machine.
+coldxx is a local Codex session manager. It reads JSONL session files from `~/.codex/sessions/YYYY/MM/DD/` and gives you a safer way to inspect, clean, back up, restore, and carefully edit history. Session contents stay on your machine unless you explicitly configure a remote rewrite backend.
 
 <img src="docs/assets/coldxx-preview.jpg" alt="coldxx local session manager preview" width="960">
 
@@ -19,7 +19,9 @@ coldxx is a local Codex session manager. It reads JSONL session files from `~/.c
 - Open a local browser UI for session inspection and JSONL record editing.
 - Browse conversation turns first, then inspect the underlying JSONL lines when needed.
 - Quickly edit user or assistant messages inside one conversation turn.
+- Rewrite individual user or assistant text blocks through local `codex exec --ephemeral` by default, or through a configured OpenAI-compatible or Anthropic-compatible backend, then explicitly save the edited turn with an automatic backup.
 - Roll a session back to a selected conversation turn by deleting later JSONL records.
+- Manage Codex profile files such as `~/.codex/deep-review.config.toml` and get the matching `codex -p deep-review` activation command.
 - Replace sensitive text in a session, such as a token pasted by mistake.
 - Drop selected JSONL lines with an automatic backup.
 - Restore deleted sessions from Trash or roll back edits from backups.
@@ -176,6 +178,35 @@ coldxx drop latest --lines 12-18 --yes
 
 Line ranges are 1-based and support `3`, `5-8`, `20-`, and comma-separated combinations.
 
+### Manage Codex Profiles
+
+List standalone profile files:
+
+```sh
+coldxx profiles list
+```
+
+Show one profile:
+
+```sh
+coldxx profiles show ctf
+```
+
+Save `~/.codex/ctf.config.toml` without touching the default `config.toml`:
+
+```sh
+coldxx profiles save ctf --file ./ctf.config.toml --yes
+```
+
+Activate it with Codex:
+
+```sh
+codex -p ctf
+codex exec -p ctf "review this change"
+```
+
+The UI settings dialog shows the default `config.toml` as read-only and can create, update, or delete standalone `xxx.config.toml` profiles. Use `instructions` for default prompt guidance. `model_instructions_file` is available as an advanced option because it overrides Codex built-in model instructions.
+
 ### Use the UI
 
 ```sh
@@ -192,6 +223,7 @@ The UI is useful when you need to:
 - Expand JSONL Lines details only when you need raw records; the Lines search does not change the Turn list.
 - Use find-only or find-and-replace on Lines. If a Turn filter is active, replacement is limited to that Turn range.
 - Quickly edit one turn's user input or assistant output from the Turn card.
+- Configure rewrite AI defaults in Settings. Rewrites use local Codex by default, with optional OpenAI-compatible or Anthropic-compatible endpoints. The per-block prompt opens in a floating editor; generated text replaces the local textarea and is written back only when you save the modal.
 - Roll back to a Turn by deleting all later JSONL records after confirmation.
 - View and edit current record JSON on the right with formatting, validation, copy, and wrapping.
 - Inspect Trash batches before restoring or emptying them.
@@ -249,4 +281,4 @@ The project currently has zero runtime dependencies. Codex session JSONL may cha
 
 ## Privacy
 
-coldxx is an independent local utility and is not affiliated with OpenAI. It works with local Codex session files and does not send session contents to any remote service.
+coldxx is an independent local utility and is not affiliated with OpenAI. It works with local Codex session files and does not send session contents to any remote service unless you explicitly use a remote rewrite backend in Settings.

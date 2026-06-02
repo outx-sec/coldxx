@@ -3,6 +3,12 @@ import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+
+const CODEX_CONFIG_SCHEMA_URL = "https://developers.openai.com/codex/config-schema.json";
+const PROFILE_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+const DEFAULT_REWRITE_PROMPT =
+  "请将这段文本改写得更清晰、准确、便于后续继续使用。保留原意，不添加原文没有的信息。只输出改写后的文本。";
 
 export class JsonlParseError extends Error {
   constructor(filePath, lineNumber, cause) {
@@ -244,6 +250,259 @@ export async function restoreSessionBackup(backupId, options = {}) {
   };
 }
 
+export function validateProfileName(name) {
+  if (!name || !PROFILE_NAME_PATTERN.test(name)) {
+    throw new Error(`Invalid profile name: ${name}. Use letters, numbers, hyphens, or underscores.`);
+  }
+  return name;
+}
+
+export function codexProfilePath(codexHome, name) {
+  validateProfileName(name);
+  return path.join(resolveCodexHome(codexHome), `${name}.config.toml`);
+}
+
+export function codexBaseConfigPath(codexHome) {
+  return path.join(resolveCodexHome(codexHome), "config.toml");
+}
+
+export function codexProfileActivation(name) {
+  validateProfileName(name);
+  return {
+    command: `codex -p ${name}`,
+    execCommand: `codex exec -p ${name} "..."`,
+  };
+}
+
+function resolveCodexConfigPath(value, configFile) {
+  const expanded = expandHome(String(value || ""));
+  if (!expanded) {
+    return "";
+  }
+  return path.isAbsolute(expanded) ? expanded : path.resolve(path.dirname(configFile), expanded);
+}
+
+export async function readCodexBaseConfig(options = {}) {
+  const codexHome = resolveCodexHome(options.codexHome);
+  const file = codexBaseConfigPath(codexHome);
+  const exists = await pathExists(file);
+  const raw = exists ? await fs.readFile(file, "utf8") : "";
+  const stat = exists ? await fs.stat(file) : null;
+  return {
+    name: "default",
+    label: "默认 config.toml",
+    kind: "default",
+    editable: false,
+    deletable: false,
+    file,
+    exists,
+    raw,
+    fields: codexProfileFields(raw),
+    modelInstructionsText: "",
+    sizeBytes: stat?.size || 0,
+    size: stat ? formatBytes(stat.size) : "",
+    updatedAt: stat?.mtime?.toISOString?.() || "",
+    command: "codex",
+    execCommand: 'codex exec "..."',
+  };
+}
+
+export async function listCodexProfiles(options = {}) {
+  const codexHome = resolveCodexHome(options.codexHome);
+  if (!(await pathExists(codexHome))) {
+    return [];
+  }
+
+  const entries = await fs.readdir(codexHome, { withFileTypes: true });
+  const profiles = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".config.toml")) {
+      continue;
+    }
+
+    const name = entry.name.slice(0, -".config.toml".length);
+    if (!PROFILE_NAME_PATTERN.test(name)) {
+      continue;
+    }
+
+    const file = path.join(codexHome, entry.name);
+    const stat = await fs.stat(file);
+    profiles.push({
+      name,
+      label: name,
+      kind: "profile",
+      editable: true,
+      deletable: true,
+      file,
+      sizeBytes: stat.size,
+      size: formatBytes(stat.size),
+      updatedAt: stat.mtime.toISOString(),
+      ...codexProfileActivation(name),
+    });
+  }
+
+  profiles.sort((a, b) => a.name.localeCompare(b.name));
+  return profiles;
+}
+
+export async function listCodexConfigs(options = {}) {
+  const base = await readCodexBaseConfig(options);
+  return [base, ...(await listCodexProfiles(options))];
+}
+
+export async function readCodexProfile(name, options = {}) {
+  validateProfileName(name);
+  const codexHome = resolveCodexHome(options.codexHome);
+  const file = codexProfilePath(codexHome, name);
+  const exists = await pathExists(file);
+  const raw = exists ? await fs.readFile(file, "utf8") : defaultCodexProfileToml();
+  const fields = codexProfileFields(raw);
+  const modelInstructionsPath = fields.model_instructions_file || "";
+  let modelInstructionsText = "";
+  const resolvedModelInstructionsPath = modelInstructionsPath ? resolveCodexConfigPath(modelInstructionsPath, file) : "";
+  if (resolvedModelInstructionsPath && (await pathExists(resolvedModelInstructionsPath))) {
+    modelInstructionsText = await fs.readFile(resolvedModelInstructionsPath, "utf8");
+  }
+  const stat = exists ? await fs.stat(file) : null;
+
+  return {
+    name,
+    label: name,
+    kind: "profile",
+    editable: true,
+    deletable: true,
+    file,
+    exists,
+    raw,
+    fields,
+    modelInstructionsText,
+    sizeBytes: stat?.size || 0,
+    size: stat ? formatBytes(stat.size) : "",
+    updatedAt: stat?.mtime?.toISOString?.() || "",
+    ...codexProfileActivation(name),
+  };
+}
+
+export async function writeCodexProfile(name, options = {}) {
+  validateProfileName(name);
+  const codexHome = resolveCodexHome(options.codexHome);
+  const file = codexProfilePath(codexHome, name);
+  let raw = typeof options.raw === "string" ? options.raw : defaultCodexProfileToml();
+  raw = ensureCodexConfigSchemaHeader(raw);
+
+  if (typeof options.instructions === "string") {
+    raw = upsertTopLevelTomlString(raw, "instructions", options.instructions);
+  }
+
+  let modelInstructionsPath = extractTopLevelTomlString(raw, "model_instructions_file");
+  if (typeof options.modelInstructionsText === "string") {
+    modelInstructionsPath = path.join(codexHome, "prompts", `${name}-model-instructions.md`);
+    await fs.mkdir(path.dirname(modelInstructionsPath), { recursive: true });
+    await fs.writeFile(modelInstructionsPath, normalizeTextFile(options.modelInstructionsText), "utf8");
+    raw = upsertTopLevelTomlString(raw, "model_instructions_file", modelInstructionsPath);
+  }
+
+  raw = normalizeTextFile(raw);
+  const backup =
+    (await pathExists(file)) && !options.skipBackup
+      ? await createBackup(file, {
+          managerHome: options.managerHome,
+          reason: `update Codex profile ${name}`,
+        })
+      : null;
+
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const tmpPath = `${file}.tmp-${process.pid}-${Date.now()}`;
+  await fs.writeFile(tmpPath, raw, "utf8");
+  await fs.rename(tmpPath, file);
+
+  const stat = await fs.stat(file);
+  return {
+    name,
+    label: name,
+    kind: "profile",
+    editable: true,
+    deletable: true,
+    file,
+    raw,
+    fields: codexProfileFields(raw),
+    modelInstructionsPath,
+    backup,
+    sizeBytes: stat.size,
+    size: formatBytes(stat.size),
+    updatedAt: stat.mtime.toISOString(),
+    ...codexProfileActivation(name),
+  };
+}
+
+export async function deleteCodexProfile(name, options = {}) {
+  validateProfileName(name);
+  const file = codexProfilePath(options.codexHome, name);
+  if (!(await pathExists(file))) {
+    throw new Error(`Codex profile not found: ${name}`);
+  }
+
+  const backup = await createBackup(file, {
+    managerHome: options.managerHome,
+    reason: `delete Codex profile ${name}`,
+  });
+  await fs.unlink(file);
+  return { name, file, backup, deleted: true };
+}
+
+export function codexProfileFields(raw) {
+  return {
+    model: extractTopLevelTomlString(raw, "model"),
+    review_model: extractTopLevelTomlString(raw, "review_model"),
+    model_provider: extractTopLevelTomlString(raw, "model_provider"),
+    oss_provider: extractTopLevelTomlString(raw, "oss_provider"),
+    model_reasoning_effort: extractTopLevelTomlString(raw, "model_reasoning_effort"),
+    model_reasoning_summary: extractTopLevelTomlString(raw, "model_reasoning_summary"),
+    model_verbosity: extractTopLevelTomlString(raw, "model_verbosity"),
+    approval_policy: extractTopLevelTomlString(raw, "approval_policy") || extractTopLevelTomlValue(raw, "approval_policy"),
+    sandbox_mode: extractTopLevelTomlString(raw, "sandbox_mode"),
+    web_search: extractTopLevelTomlString(raw, "web_search"),
+    personality: extractTopLevelTomlString(raw, "personality"),
+    openai_base_url: extractTopLevelTomlString(raw, "openai_base_url"),
+    instructions: extractTopLevelTomlString(raw, "instructions"),
+    model_instructions_file: extractTopLevelTomlString(raw, "model_instructions_file"),
+  };
+}
+
+export async function rewriteText(text, options = {}) {
+  const sourceText = String(text || "");
+  if (!sourceText.trim()) {
+    throw new Error("Text to rewrite is required");
+  }
+
+  const rewritePrompt = options.prompt || DEFAULT_REWRITE_PROMPT;
+  const input = buildTextRewritePrompt(sourceText, rewritePrompt, options);
+  const llmProvider = normalizeRewriteLlmProvider(options.llmProvider || options.provider);
+  const result =
+    llmProvider === "openai"
+      ? await runOpenAICompatibleRewrite(input, options)
+      : llmProvider === "anthropic"
+        ? await runAnthropicCompatibleRewrite(input, options)
+        : await runCodexExec(input, {
+            codexCommand: options.codexCommand,
+            codexHome: options.codexHome,
+            cwd: options.cwd,
+            profile: options.profile,
+            model: options.model,
+            timeoutMs: options.timeoutMs,
+          });
+
+  return {
+    profile: options.profile || "",
+    model: options.model || "",
+    provider: llmProvider,
+    prompt: rewritePrompt,
+    output: result.output,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
 export async function scanSessions(options = {}) {
   const codexHome = resolveCodexHome(options.codexHome);
   const root = sessionsRoot(codexHome);
@@ -269,6 +528,7 @@ export async function readSessionSummary(filePath, options = {}) {
     relativePath: safeRelative(root, filePath),
     startedAt: timestampFromFilename(filePath) || stat.birthtime.toISOString(),
     updatedAt: stat.mtime.toISOString(),
+    fileUpdatedAt: stat.mtime.toISOString(),
     sizeBytes: stat.size,
     lines: 0,
     types: {},
@@ -528,6 +788,7 @@ export async function listTrash(options = {}) {
 }
 
 export async function restoreTrashBatch(batchId, options = {}) {
+  validateStorageId(batchId, "trash batch id");
   const managerHome = resolveManagerHome(options.managerHome);
   const trashRoot = path.join(managerHome, "trash");
   const batchDir = path.join(trashRoot, batchId);
@@ -1265,7 +1526,7 @@ function pathToString(pathParts) {
 }
 
 export function sessionIsActive(session, windowMinutes = 10, now = Date.now()) {
-  const updatedAt = Date.parse(session?.updatedAt);
+  const updatedAt = Date.parse(session?.fileUpdatedAt || session?.updatedAt);
   if (!Number.isFinite(updatedAt)) {
     return false;
   }
@@ -1495,6 +1756,372 @@ function firstText(value, seen = new Set()) {
     }
   }
   return "";
+}
+
+function defaultCodexProfileToml() {
+  return `${schemaHeaderLine()}\n# Codex profile file. Activate it with: codex -p <profile>\n\n`;
+}
+
+function ensureCodexConfigSchemaHeader(raw) {
+  const body = normalizeTextFile(raw);
+  if (/^\s*#:schema\s+/m.test(body)) {
+    return body;
+  }
+  return `${schemaHeaderLine()}\n${body}`;
+}
+
+function schemaHeaderLine() {
+  return `#:schema ${CODEX_CONFIG_SCHEMA_URL}`;
+}
+
+function normalizeTextFile(input) {
+  const text = String(input ?? "").replace(/\r\n?/g, "\n");
+  return text.endsWith("\n") ? text : `${text}\n`;
+}
+
+function upsertTopLevelTomlString(raw, key, value) {
+  const clean = removeTopLevelTomlKey(raw, key);
+  const lines = clean.split("\n");
+  const insertAt = lines[0]?.startsWith("#:schema ") ? 1 : 0;
+  lines.splice(insertAt, 0, `${key} = ${tomlBasicString(value)}`);
+  return normalizeTextFile(lines.join("\n").replace(/\n{3,}/g, "\n\n"));
+}
+
+function removeTopLevelTomlKey(raw, key) {
+  const lines = normalizeTextFile(raw).split("\n");
+  const out = [];
+  const keyPattern = new RegExp(`^\\s*${escapeRegex(key)}\\s*=`);
+  let inTable = false;
+  let skipUntil = "";
+
+  for (const line of lines) {
+    if (skipUntil) {
+      if (line.includes(skipUntil)) {
+        skipUntil = "";
+      }
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!inTable && keyPattern.test(line)) {
+      const valuePart = line.slice(line.indexOf("=") + 1).trimStart();
+      if (valuePart.startsWith('"""') && !valuePart.slice(3).includes('"""')) {
+        skipUntil = '"""';
+      } else if (valuePart.startsWith("'''") && !valuePart.slice(3).includes("'''")) {
+        skipUntil = "'''";
+      }
+      continue;
+    }
+
+    if (/^\s*\[/.test(trimmed)) {
+      inTable = true;
+    }
+    out.push(line);
+  }
+
+  return normalizeTextFile(out.join("\n"));
+}
+
+function extractTopLevelTomlString(raw, key) {
+  const value = extractTopLevelTomlValue(raw, key);
+  if (!value) {
+    return "";
+  }
+
+  if (value.startsWith('"""') || value.startsWith("'''")) {
+    const marker = value.slice(0, 3);
+    const end = value.lastIndexOf(marker);
+    if (end > 2) {
+      return value.slice(3, end);
+    }
+    return "";
+  }
+
+  if (value.startsWith('"')) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value.slice(1).replace(/"$/, "");
+    }
+  }
+
+  if (value.startsWith("'")) {
+    return value.slice(1).replace(/'$/, "");
+  }
+
+  return "";
+}
+
+function extractTopLevelTomlValue(raw, key) {
+  const lines = normalizeTextFile(raw).split("\n");
+  const keyPattern = new RegExp(`^\\s*${escapeRegex(key)}\\s*=`);
+  let inTable = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (/^\s*\[/.test(trimmed)) {
+      inTable = true;
+    }
+    if (inTable || !keyPattern.test(line)) {
+      continue;
+    }
+
+    const valuePart = line.slice(line.indexOf("=") + 1).trim();
+    if (valuePart.startsWith('"""') && !valuePart.slice(3).includes('"""')) {
+      return collectMultilineTomlValue(lines, index, '"""');
+    }
+    if (valuePart.startsWith("'''") && !valuePart.slice(3).includes("'''")) {
+      return collectMultilineTomlValue(lines, index, "'''");
+    }
+    return stripTomlInlineComment(valuePart).trim();
+  }
+
+  return "";
+}
+
+function collectMultilineTomlValue(lines, startIndex, marker) {
+  const chunks = [lines[startIndex].slice(lines[startIndex].indexOf("=") + 1).trimStart()];
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    chunks.push(lines[index]);
+    if (lines[index].includes(marker)) {
+      break;
+    }
+  }
+  return chunks.join("\n");
+}
+
+function stripTomlInlineComment(value) {
+  let quote = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if ((char === '"' || char === "'") && value[index - 1] !== "\\") {
+      quote = quote === char ? "" : quote || char;
+    }
+    if (!quote && char === "#") {
+      return value.slice(0, index);
+    }
+  }
+  return value;
+}
+
+function tomlBasicString(value) {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function buildTextRewritePrompt(text, rewritePrompt, options = {}) {
+  return [
+    "你是一个文本转写助手。",
+    "请根据用户给出的转写要求，改写下面这一段文本。",
+    "要求：只输出转写后的文本；不要解释过程；不要添加原文没有的信息。",
+    "",
+    "<rewrite_prompt>",
+    rewritePrompt,
+    "</rewrite_prompt>",
+    "",
+    "<source>",
+    options.side ? `side: ${options.side}` : "",
+    text,
+    "</source>",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+function normalizeRewriteLlmProvider(value) {
+  const provider = String(value || "codex").toLowerCase();
+  if (provider === "openai-compatible") {
+    return "openai";
+  }
+  if (provider === "anthropic-compatible") {
+    return "anthropic";
+  }
+  if (provider === "openai" || provider === "anthropic" || provider === "codex") {
+    return provider;
+  }
+  throw new Error(`Unsupported rewrite LLM provider: ${value}`);
+}
+
+async function runOpenAICompatibleRewrite(input, options = {}) {
+  const model = String(options.model || "").trim();
+  if (!model) {
+    throw new Error("OpenAI-compatible rewrite model is required");
+  }
+  const url = compatibleEndpoint(options.baseUrl || "https://api.openai.com/v1", "/chat/completions");
+  const body = {
+    model,
+    messages: [{ role: "user", content: input }],
+  };
+  const result = await postJson(url, body, {
+    "content-type": "application/json",
+    ...(options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}),
+  }, options);
+  const output = textValue(result?.choices?.[0]?.message?.content) || textValue(result?.choices?.[0]?.text);
+  if (!output) {
+    throw new Error("OpenAI-compatible rewrite response did not include text output");
+  }
+  return { output: output.trim(), stdout: JSON.stringify(result), stderr: "", command: `POST ${url}` };
+}
+
+async function runAnthropicCompatibleRewrite(input, options = {}) {
+  const model = String(options.model || "").trim();
+  if (!model) {
+    throw new Error("Anthropic-compatible rewrite model is required");
+  }
+  const url = compatibleEndpoint(options.baseUrl || "https://api.anthropic.com/v1", "/messages");
+  const body = {
+    model,
+    max_tokens: Number.parseInt(String(options.maxTokens || "4096"), 10) || 4096,
+    messages: [{ role: "user", content: input }],
+  };
+  const result = await postJson(url, body, {
+    "content-type": "application/json",
+    "anthropic-version": options.anthropicVersion || "2023-06-01",
+    ...(options.apiKey ? { "x-api-key": options.apiKey } : {}),
+  }, options);
+  const output = Array.isArray(result?.content)
+    ? result.content.map((item) => textValue(item?.text)).filter(Boolean).join("\n")
+    : textValue(result?.completion);
+  if (!output) {
+    throw new Error("Anthropic-compatible rewrite response did not include text output");
+  }
+  return { output: output.trim(), stdout: JSON.stringify(result), stderr: "", command: `POST ${url}` };
+}
+
+function compatibleEndpoint(baseUrl, suffix) {
+  const clean = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!clean) {
+    throw new Error("Rewrite API base URL is required");
+  }
+  return clean.endsWith(suffix) ? clean : `${clean}${suffix}`;
+}
+
+async function postJson(url, body, headers, options = {}) {
+  const fetchImpl = options.fetch || globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new Error("fetch is not available in this Node.js runtime");
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 5 * 60 * 1000);
+  try {
+    const response = await fetchImpl(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let parsed = {};
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = { text };
+      }
+    }
+    if (!response.ok) {
+      throw new Error(`Rewrite API request failed (${response.status}): ${text || response.statusText}`);
+    }
+    return parsed;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runCodexExec(input, options = {}) {
+  const command = options.codexCommand || "codex";
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "coldxx-rewrite-"));
+  const outputPath = path.join(tmpDir, "last-message.txt");
+  const args = ["exec"];
+
+  if (options.profile) {
+    validateProfileName(options.profile);
+    args.push("-p", options.profile);
+  }
+  if (options.model) {
+    args.push("-m", String(options.model));
+  }
+
+  args.push(
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
+    "--disable",
+    "shell_tool",
+    "-c",
+    'approval_policy="never"',
+    "-o",
+    outputPath,
+    "-",
+  );
+
+  try {
+    const result = await runProcess(command, args, input, {
+      cwd: options.cwd || process.cwd(),
+      timeoutMs: options.timeoutMs || 5 * 60 * 1000,
+      env: options.codexHome ? { ...process.env, CODEX_HOME: resolveCodexHome(options.codexHome) } : process.env,
+    });
+    const output = (await pathExists(outputPath)) ? await fs.readFile(outputPath, "utf8") : result.stdout;
+    return { ...result, output: output.trim() };
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function runProcess(command, args, input, options = {}) {
+  const maxOutputBytes = 1024 * 1024;
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`Command timed out after ${options.timeoutMs}ms: ${command}`));
+    }, options.timeoutMs);
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout = appendLimited(stdout, chunk, maxOutputBytes);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = appendLimited(stderr, chunk, maxOutputBytes);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(`Command failed (${code}): ${command} ${args.join(" ")}\n${stderr || stdout}`.trim()));
+        return;
+      }
+      resolve({ stdout, stderr, command: `${command} ${args.join(" ")}` });
+    });
+    child.stdin.end(input);
+  });
+}
+
+function appendLimited(current, chunk, maxBytes) {
+  const next = current + chunk.toString("utf8");
+  if (Buffer.byteLength(next, "utf8") <= maxBytes) {
+    return next;
+  }
+  return next.slice(-maxBytes);
+}
+
+function validateStorageId(value, label) {
+  if (!value || !/^[A-Za-z0-9._-]+$/.test(value) || value === "." || value === "..") {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function moveFile(sourcePath, destinationPath) {

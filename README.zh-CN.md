@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime deps](https://img.shields.io/badge/runtime_deps-0-brightgreen.svg)](package.json)
 
-本机 Codex session 管理工具。coldxx 读取 `~/.codex/sessions/YYYY/MM/DD/` 下的 JSONL session 文件，帮你查看、清理、备份、恢复和谨慎修改历史记录。所有操作都在本机完成，session 内容不会被上传到远程服务。
+本机 Codex session 管理工具。coldxx 读取 `~/.codex/sessions/YYYY/MM/DD/` 下的 JSONL session 文件，帮你查看、清理、备份、恢复和谨慎修改历史记录。除非你显式配置远程改写后端，否则 session 内容不会被上传到远程服务。
 
 <img src="docs/assets/coldxx-preview.jpg" alt="coldxx 本机 session 管理界面预览" width="960">
 
@@ -18,7 +18,9 @@
 - 批量清理历史 session，默认移动到 Trash，后续还能恢复。
 - 打开图形界面，优先按对话轮查看，再按需展开底层 JSONL 明细。
 - 快速修改某一轮对话中的用户输入或助手输出。
+- 在快速编辑弹窗里，对每条用户输入或助手输出默认调用本机 `codex exec --ephemeral` 改写，也可配置 OpenAI-compatible 或 Anthropic-compatible 后端，再按需保存并自动备份。
 - 快速回退到某一轮对话状态，删除这轮之后的 JSONL 记录。
+- 管理 Codex 独立 profile 配置，保存 `~/.codex/xxx.config.toml` 并提示 `codex -p xxx` 激活方式。
 - 修改某个 session 里的历史文本，例如把误粘贴的 token 替换成 `[REDACTED]`。
 - 删除 JSONL 中的指定记录行，并自动创建备份。
 - 在改错后，从操作历史或 Trash 中快速回滚。
@@ -181,6 +183,35 @@ coldxx drop latest --lines 12-18 --yes
 
 行号范围是 1-based，支持 `3`、`5-8`、`20-` 和逗号组合。
 
+### 管理 Codex profiles
+
+列出现有独立 profile 文件：
+
+```sh
+coldxx profiles list
+```
+
+查看某个 profile：
+
+```sh
+coldxx profiles show ctf
+```
+
+保存 `~/.codex/ctf.config.toml`，不会修改默认 `config.toml`：
+
+```sh
+coldxx profiles save ctf --file ./ctf.config.toml --yes
+```
+
+保存后使用：
+
+```sh
+codex -p ctf
+codex exec -p ctf "review this change"
+```
+
+图形界面的设置弹框会只读展示默认 `config.toml`，并可新建、修改或删除独立的 `xxx.config.toml`。默认提示词建议写入 `instructions`；高级模式可以写 `model_instructions_file`，但这会覆盖 Codex 内置 model instructions，应谨慎使用。
+
 ### 使用图形界面
 
 ```sh
@@ -196,7 +227,8 @@ coldxx ui --host 127.0.0.1 --port 4765
 - 按文本、角色、记录类型、范围、大小写和正则筛选 Turn。
 - 需要原始记录时再展开 JSONL Lines 明细；Lines 查找不会反向改变 Turn 列表。
 - 在 Lines 里只查找，或启用替换后写入；如果上方有 Turn 筛选，替换会限制在当前 Turn 范围。
-- 从 Turn 卡片快速修改这一轮的用户输入或助手输出。
+- 从 Turn 卡片打开快速修改弹窗，编辑这一轮的用户输入或助手输出。
+- 在设置里配置改写 AI 默认参数。改写默认使用本地 Codex，也可配置 OpenAI-compatible 或 Anthropic-compatible 后端。每条改写会悬浮打开提示词输入框，生成结果会替换本地文本框，只有保存弹窗后才写回 session。
 - 从 Turn 卡片回退到此处，确认后删除后续 JSONL 记录。
 - 右侧查看当前记录的 JSON，支持格式化、校验、复制和自动换行。
 - 从 Trash 弹窗查看已删除 batch 里具体有哪些 session，再恢复或清空。
@@ -268,4 +300,4 @@ npm test
 
 ## 隐私和声明
 
-coldxx 是独立的本机工具，不隶属于 OpenAI。它只读取和修改你本机的 Codex session 文件，不会把 session 内容发送到远程服务。
+coldxx 是独立的本机工具，不隶属于 OpenAI。它只读取和修改你本机的 Codex session 文件；除非你在设置里显式使用远程改写后端，否则不会把 session 内容发送到远程服务。
